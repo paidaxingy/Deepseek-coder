@@ -275,7 +275,14 @@ export class DeepSeekPlaywright {
   /**
    * 专门针对 DeepSeek UI 的发送逻辑
    */
-  private async sendPromptToDeepSeek(page: Page, prompt: string, debug?: DebugFn, deepThink?: boolean) {
+  private async sendPromptToDeepSeek(
+    page: Page,
+    prompt: string,
+    debug?: DebugFn,
+    deepThink?: boolean,
+    messageLocator?: ReturnType<Page["locator"]>,
+    baseCount?: number
+  ) {
     // 0. 等待上一个回复完成（确保不是"暂停"按钮状态）
     await this.waitForDeepSeekReady(page, debug);
     await this.ensureDeepThinkEnabled(page, debug, deepThink);
@@ -296,6 +303,41 @@ export class DeepSeekPlaywright {
     // 等待一下让 UI 更新
     await this.safeWait(page, 500);
     
+    const isGeneratingNow = async (): Promise<boolean> => {
+      // 尽量与 waitForDeepSeekReady 的“stop icon”判定保持一致
+      return await page
+        .evaluate(() => {
+          const svgs = document.querySelectorAll("div[class*='ds-icon-button'] svg");
+          for (let i = 0; i < svgs.length; i++) {
+            const svg = svgs[i];
+            const rect = svg.querySelector("rect");
+            if (!rect) continue;
+            const parent = svg.closest("div[class*='ds-icon-button']");
+            if (!parent) continue;
+            const r = parent.getBoundingClientRect();
+            if (r.width > 20 && r.top > window.innerHeight * 0.5) return true;
+          }
+          return false;
+        })
+        .catch(() => false);
+    };
+
+    const isMessageCountIncreased = async (): Promise<boolean> => {
+      if (!messageLocator) return false;
+      if (typeof baseCount !== "number") return false;
+      const c = await messageLocator.count().catch(() => 0);
+      return c > baseCount;
+    };
+
+    const confirmSent = async (): Promise<boolean> => {
+      // 多信号确认：避免仅靠 textarea 清空导致误判
+      if (await isGeneratingNow()) return true;
+      if (await isMessageCountIncreased()) return true;
+      const remaining = await input.inputValue().catch(() => prompt);
+      if (remaining.length < prompt.length * 0.3) return true;
+      return false;
+    };
+
     // 2. 找到并点击发送按钮（DeepSeek 的发送按钮）
     // 通过诊断确认：发送按钮 class 包含 _7436101 和 ds-icon-button
     const sendButtonSelectors = [
@@ -324,9 +366,8 @@ export class DeepSeekPlaywright {
             debug?.({ level: "info", msg: "clicked send button", data: { selector } });
             await this.safeWait(page, 800);
             
-            // 检查是否发送成功（输入框应该清空）
-            const remaining = await input.inputValue().catch(() => prompt);
-            if (remaining.length < prompt.length * 0.3) {
+            // 检查是否发送成功（多信号确认：生成中 / 消息增量 / 输入框明显变短）
+            if (await confirmSent()) {
               sent = true;
               debug?.({ level: "info", msg: "send confirmed (input cleared)" });
               break;
@@ -346,9 +387,8 @@ export class DeepSeekPlaywright {
       await input.click();
       await input.press("Enter");
       await this.safeWait(page, 500);
-      
-      let remaining = await input.inputValue().catch(() => prompt);
-      if (remaining.length < prompt.length * 0.3) {
+
+      if (await confirmSent()) {
         sent = true;
         debug?.({ level: "info", msg: "sent via Enter key" });
       }
@@ -357,9 +397,8 @@ export class DeepSeekPlaywright {
         // 尝试 Ctrl+Enter
         await input.press("Control+Enter");
         await this.safeWait(page, 500);
-        
-        remaining = await input.inputValue().catch(() => prompt);
-        if (remaining.length < prompt.length * 0.3) {
+
+        if (await confirmSent()) {
           sent = true;
           debug?.({ level: "info", msg: "sent via Ctrl+Enter" });
         }
@@ -369,9 +408,8 @@ export class DeepSeekPlaywright {
         // 尝试 Meta+Enter (Mac)
         await input.press("Meta+Enter");
         await this.safeWait(page, 500);
-        
-        remaining = await input.inputValue().catch(() => prompt);
-        if (remaining.length < prompt.length * 0.3) {
+
+        if (await confirmSent()) {
           sent = true;
           debug?.({ level: "info", msg: "sent via Meta+Enter" });
         }
@@ -406,8 +444,7 @@ export class DeepSeekPlaywright {
       });
       
       await this.safeWait(page, 800);
-      const remaining = await input.inputValue().catch(() => prompt);
-      if (remaining.length < prompt.length * 0.3) {
+      if (await confirmSent()) {
         sent = true;
         debug?.({ level: "info", msg: "sent via JS click" });
       }
@@ -694,7 +731,7 @@ export class DeepSeekPlaywright {
     opts?.debug?.({ level: "info", msg: "message baseCount", data: { baseCount } });
 
     // 发送 prompt（专门针对 DeepSeek UI）
-    await this.sendPromptToDeepSeek(page, prompt, opts?.debug, opts?.deepThink);
+    await this.sendPromptToDeepSeek(page, prompt, opts?.debug, opts?.deepThink, messageLocator, baseCount);
 
     // 等待新消息并获取内容
     const assistantText = await this.waitForNewMessageStreaming(
@@ -1038,6 +1075,16 @@ export class DeepSeekPlaywright {
     const jsonMatch = /\{[\s\S]*?"read"\s*:\s*\[[\s\S]*?\][\s\S]*?\}/m.exec(text);
     if (jsonMatch && this.isValidToolJson("toolplan", jsonMatch[0])) {
       return ["```toolplan", jsonMatch[0].trim(), "```"].join("\n");
+    }
+
+    // 尝试提取裸 JSON（toolcall 格式）：DeepSeek 网页端有时会把 ```toolcall``` 渲染成
+    // toolcall\nCopy\nDownload\n{...}（innerText 丢失围栏）。此处用括号深度匹配补回围栏。
+    const toolKeyIdx = Math.max(text.toLowerCase().lastIndexOf("toolcall"), text.search(/"tool"\s*:/));
+    if (toolKeyIdx !== -1) {
+      const json = this.extractFirstJsonObjectFrom(text, toolKeyIdx);
+      if (json && this.isValidToolJson("toolcall", json)) {
+        return ["```toolcall", json.trim(), "```"].join("\n");
+      }
     }
     
     // 尝试提取 diff --git

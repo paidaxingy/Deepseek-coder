@@ -128,6 +128,12 @@ export function checkBashCommandSafety(cmd: string, mode: BashSafetyMode = "rela
     return { ok: false, reason: "出于安全原因，自动执行默认禁用 sudo（请手动在终端执行）" };
   }
 
+  // 允许 cd（shell 内建）：仅用于执行脚本块时保持工作目录；仍受上面的语法限制与模式约束
+  if (first === "cd") {
+    void second;
+    return { ok: true };
+  }
+
   const allowed = new Set(["rm", "mv", "cp", "mkdir", "touch", "cat", "ls", "pwd", "npm", "yarn", "git"]);
   const tool = first;
   if (!allowed.has(tool)) {

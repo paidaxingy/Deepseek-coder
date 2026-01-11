@@ -319,6 +319,8 @@ class DeepSeekViewProvider {
                     }
                     case "bashRun": {
                         const tid = await this.ensureThread();
+                        if (await this.rejectIfBusy("执行 bash", tid))
+                            return;
                         const bashText = String(msg.bashText || "").trim();
                         if (!bashText)
                             return;
@@ -339,11 +341,9 @@ class DeepSeekViewProvider {
                         if (!userText)
                             return;
                         this.deepThinkMode = !!msg.deepThink;
-                        // 若已有在跑的请求，先取消（避免并发写同一线程）
-                        if (this.active?.abort) {
-                            this.debug("warn", "auto-cancel previous request (new send)");
-                            this.active.abort.abort();
-                        }
+                        // busy 时不自动中断：避免“操作快就自己中断”
+                        if (await this.rejectIfBusy("发送消息", tid))
+                            return;
                         await this.store.addMessage(tid, "user", userText);
                         await this.pushState();
                         // 统一策略：去掉“做项目/介绍项目/查环境”等特殊判断，永远走同一套 tooling prompt。
@@ -411,10 +411,8 @@ class DeepSeekViewProvider {
                         const prompt = msg.prompt?.trim() || "";
                         if (!prompt)
                             return;
-                        if (this.active?.abort) {
-                            this.debug("warn", "auto-cancel previous request (new raw send)");
-                            this.active.abort.abort();
-                        }
+                        if (await this.rejectIfBusy("发送 Raw Prompt", tid))
+                            return;
                         await this.store.addMessage(tid, "user", prompt);
                         await this.pushState();
                         const assistantId = `assistant_${Date.now()}_${Math.random().toString(16).slice(2)}`;
@@ -489,6 +487,8 @@ class DeepSeekViewProvider {
                         return;
                     }
                     case "applyPatchText":
+                        if (await this.rejectIfBusy("应用补丁"))
+                            return;
                         // 精简模式：不暴露 applyPatchText 命令；直接预览并确认
                         await (0, applyPatch_1.applyPatchTextWithPreviewAndConfirm)(msg.patchText);
                         return;
@@ -576,12 +576,16 @@ class DeepSeekViewProvider {
                     }
                     case "toolPlanRun": {
                         const tid = await this.ensureThread();
+                        if (await this.rejectIfBusy("执行 toolplan", tid))
+                            return;
                         this.debug("info", "toolPlanRun", { threadId: tid, planChars: msg.planText?.length ?? 0 });
                         await this.runToolPlanAndGeneratePatch(tid, msg.planText);
                         return;
                     }
                     case "toolCallRun": {
                         const tid = await this.ensureThread();
+                        if (await this.rejectIfBusy("执行 toolcall", tid))
+                            return;
                         await this.runToolCallAndContinue(tid, msg.callText);
                         return;
                     }
@@ -609,6 +613,22 @@ class DeepSeekViewProvider {
     }
     setBusy(busy) {
         this._post({ type: "requestState", busy: !!busy });
+    }
+    isBusy() {
+        return Boolean(this.active?.abort);
+    }
+    isBusyOtherThread(threadId) {
+        if (!this.isBusy())
+            return false;
+        const cur = this.active?.threadId;
+        return Boolean(cur && cur !== threadId);
+    }
+    async rejectIfBusy(actionName, threadId) {
+        if (!this.isBusy())
+            return false;
+        const tid = threadId ?? (await this.ensureThread());
+        await this.notifyInChat(tid, `⏳ 正在处理中（${actionName}）。请先等待完成，或点击「停止」后再试。`);
+        return true;
     }
     async setReadOnly(enabled) {
         this.readOnlyMode = !!enabled;
@@ -912,7 +932,7 @@ class DeepSeekViewProvider {
             "- 需要信息再动手：不确定文件路径/内容 → 先输出 toolplan 读取再继续",
             "- 你计划“新建”的文件：不要在 toolplan 里去 read（会读不到并产生噪音）；请用 bash 创建或用 diff new file 直接新增",
             "- bash 尽量简单：允许 &&/||；避免管道 |、命令替换 $() 等高风险语法（可能被安全策略拦截/要求确认）",
-            "- 禁止使用 cd（扩展端逐条执行命令，cd 不会保留；请用相对路径例如 demo/index.html）",
+            "- 允许使用 cd，但请把需要保持目录切换的操作写在同一个 bash 代码块里（扩展会把含 cd 的 bash 作为脚本整体执行）",
             "- 禁止发明不存在的工具/字段：toolcall 的 JSON 顶层只能有 tool 和 args；不要输出 type/write_file/command/file_path/content 等字段",
             "- 工具结果足够后就停：不要无限继续调用工具",
             "",
@@ -934,6 +954,7 @@ class DeepSeekViewProvider {
             "【重要】整个回复只能包含这一个 ```toolcall``` 代码块；代码块外不能有任何文字！",
             "【重要】searchText 必须提供非空 query；glob 可选（如 \"**/*.{ts,tsx}\"）",
             "【重要】toolcall JSON 的顶层字段只能是 tool 和 args（不要输出 type/command/file_path/content 这类字段）。",
+            "【禁止】不要输出这种自造格式：{\"searchText\":{...}}（顶层 key=工具名）。必须是 {\"tool\":\"searchText\",\"args\":{...}}。",
             "",
             "## 格式 C: unified diff（修改代码时使用）",
             "必须输出一个 markdown 代码块，语言标识为 `diff`，代码块内是 unified diff：",
@@ -948,6 +969,8 @@ class DeepSeekViewProvider {
             "```",
             "【重要】只能输出这一个 ```diff``` 代码块；代码块外不能有任何文字！（禁止输出裸 diff，必须放进 ```diff 代码块）",
             "【重要】凡是“写代码/生成文件/修改文件内容”，必须使用 diff；禁止用 bash 的 cat/echo/heredoc 去写入源代码。",
+            "【重要】每次只能修改/新增 **一个文件**：一个 diff 代码块里只允许出现 **一段** `diff --git a/... b/...`（不要把多个文件的 diff 拼在一起）。",
+            "【重要】如果需要修改多个文件：请分多轮输出；每轮只输出一个文件的 diff，等待系统应用并继续追问后，再输出下一个文件的 diff。",
             "",
             "## 格式 D: bash（需要执行 Linux 命令时使用，如删除文件、安装依赖等）",
             "输出一个 markdown 代码块，语言标识为 `bash`：",
@@ -1062,201 +1085,180 @@ class DeepSeekViewProvider {
                 return s;
             return s.slice(idx + "<<<DS_ANSWER>>>".length).trim();
         };
-        // 0) 只执行“最后一个 fenced 动作块”（避免思考区夹带 diff/toolplan/toolcall/bash 被误触发）
-        const pickLastFencedAction = (text) => {
-            const raw = String(text || "");
-            const patterns = [
-                { kind: "diff", re: /```diff\s*([\s\S]*?)```/g },
-                { kind: "bash", re: /```(?:bash|sh|shell)\s*([\s\S]*?)```/g },
-                { kind: "toolcall", re: /```toolcall\s*([\s\S]*?)```/g },
-                { kind: "toolplan", re: /```toolplan\s*([\s\S]*?)```/g }
-            ];
-            let best;
-            for (const p of patterns) {
-                let m = null;
-                while ((m = p.re.exec(raw))) {
-                    const body = (m[1] || "").trim();
-                    const idx = m.index ?? 0;
-                    if (!body)
-                        continue;
-                    if (!best || idx > best.idx)
-                        best = { kind: p.kind, idx, body };
-                }
-            }
-            return best ? { kind: best.kind, body: best.body } : undefined;
-        };
         // 关键：如果存在 1:1 结构化文本，只从“最终回答区”执行（思考区永远不触发任何功能）
         const execText = extractStructuredAnswer(replyText);
-        const lastFenced = pickLastFencedAction(execText);
-        if (lastFenced) {
-            try {
-                if (lastFenced.kind === "diff") {
-                    if (this.readOnlyMode) {
-                        await this.notifyInChat(threadId, "🔒 只读模式：检测到 diff，未自动应用。你可以点击消息里的「预览并应用补丁」手动确认。");
-                        return;
+        const trimmed = String(execText || "").trim();
+        // 兼容模型“自造”的 toolcall 结构：
+        // - 标准：{"tool":"searchText","args":{...}}
+        // - 变体：{"searchText":{...}}（顶层 key=tool，value=args）
+        const normalizeLooseToolCall = (obj) => {
+            if (!obj || typeof obj !== "object")
+                return undefined;
+            if (typeof obj.tool === "string" && obj.tool.trim()) {
+                return { tool: String(obj.tool), args: obj.args ?? {} };
+            }
+            // 变体：顶层只有一个 key，且 value 是 object
+            const keys = Object.keys(obj);
+            if (keys.length === 1) {
+                const k = keys[0];
+                const v = obj[k];
+                if (typeof k === "string" && k.trim() && v && typeof v === "object" && !Array.isArray(v)) {
+                    return { tool: k, args: v };
+                }
+            }
+            return undefined;
+        };
+        const parseStrictAction = (s0) => {
+            const s = String(s0 || "").trim();
+            if (!s)
+                return undefined;
+            // DeepSeek 网页端常见污染格式：
+            // toolcall\nCopy\nDownload\n{...}  或  toolplan\nCopy\nDownload\n{...}
+            // 围栏被 UI 吞掉时，做一次“关键词 + JSON 括号匹配”归一化。
+            const lower = s.toLowerCase();
+            const idxToolcall = lower.lastIndexOf("toolcall");
+            if (idxToolcall !== -1) {
+                const json = this.extractFirstJsonObjectFrom(s, idxToolcall);
+                if (json) {
+                    try {
+                        const obj = JSON.parse(json);
+                        const norm = normalizeLooseToolCall(obj);
+                        if (norm?.tool)
+                            return { kind: "toolcall", body: JSON.stringify({ tool: norm.tool, args: norm.args ?? {} }) };
                     }
-                    const sig = `diff:${lastFenced.body.slice(0, 800)}`;
-                    if (await this.stopIfRepeated(threadId, sig, "diff(fenced,last,repeated)"))
-                        return;
-                    await this.autoApplyDiff(threadId, lastFenced.body);
-                    return;
-                }
-                if (lastFenced.kind === "bash") {
-                    if (this.readOnlyMode) {
-                        await this.notifyInChat(threadId, "🔒 只读模式：检测到 bash，未自动执行。");
-                        return;
+                    catch {
+                        // ignore
                     }
-                    const sig = `bash:${lastFenced.body.trim().slice(0, 500)}`;
-                    if (await this.stopIfRepeated(threadId, sig, "bash(fenced,last,repeated)"))
-                        return;
-                    await this.autoExecuteBash(threadId, lastFenced.body);
-                    return;
-                }
-                if (lastFenced.kind === "toolcall") {
-                    const callJson = lastFenced.body;
-                    const normalized = (0, toolcall_1.normalizeToolCallObject)(JSON.parse(callJson));
-                    const sig = `toolcall:${normalized.tool}:${this.stableStringify(normalized.args)}`;
-                    if (await this.stopIfRepeated(threadId, sig, "toolcall(fenced,last,repeated)"))
-                        return;
-                    await this.runToolCallAndContinueAuto(threadId, callJson);
-                    return;
-                }
-                if (lastFenced.kind === "toolplan") {
-                    // toolplan 仍按原逻辑执行
-                    await this.runToolPlanAndGeneratePatch(threadId, lastFenced.body);
-                    return;
                 }
             }
-            catch (e) {
-                this.debug("error", "autoProcessReply: fenced action execution failed", { error: e instanceof Error ? e.message : String(e) });
-                // 失败则继续走旧逻辑兜底
-            }
-        }
-        // 0) OpenCoder 风格：先做“输出修复/归一化”，把模型的错误格式转成可执行的 bash/diff
-        try {
-            const repaired = await this.tryRepairUnsupportedToolOutputs(threadId, execText);
-            if (repaired?.kind === "bash") {
-                if (this.readOnlyMode) {
-                    await this.notifyInChat(threadId, "🔒 只读模式：检测到 bash，未自动执行。");
-                    return;
+            const idxToolplan = lower.lastIndexOf("toolplan");
+            if (idxToolplan !== -1) {
+                const json = this.extractFirstJsonObjectFrom(s, idxToolplan);
+                if (json) {
+                    try {
+                        const obj = JSON.parse(json);
+                        if (Array.isArray(obj?.read))
+                            return { kind: "toolplan", body: json.trim() };
+                    }
+                    catch {
+                        // ignore
+                    }
                 }
-                const sig = `bash:${repaired.cmd.trim().slice(0, 500)}`;
-                if (await this.stopIfRepeated(threadId, sig, "bash(repaired,repeated)"))
-                    return;
-                await this.autoExecuteBash(threadId, repaired.cmd);
-                return;
             }
-            if (repaired?.kind === "diff") {
-                if (this.readOnlyMode) {
-                    await this.notifyInChat(threadId, "🔒 只读模式：检测到 diff，未自动应用。你可以点击消息里的「预览并应用补丁」手动确认。");
-                    return;
+            const mDiff = /^```diff\s*([\s\S]*?)```$/.exec(s);
+            if (mDiff) {
+                const body = String(mDiff[1] || "").trim();
+                if (!body.startsWith("diff --git "))
+                    return undefined;
+                return { kind: "diff", body };
+            }
+            const mBash = /^```(?:bash|sh|shell)\s*([\s\S]*?)```$/.exec(s);
+            if (mBash) {
+                const body = String(mBash[1] || "").trim();
+                if (!body)
+                    return undefined;
+                return { kind: "bash", body };
+            }
+            const mToolcall = /^```toolcall\s*([\s\S]*?)```$/.exec(s);
+            if (mToolcall) {
+                const body = String(mToolcall[1] || "").trim();
+                if (!body)
+                    return undefined;
+                try {
+                    const obj = JSON.parse(body);
+                    if (typeof obj?.tool !== "string" || !obj.tool)
+                        return undefined;
                 }
-                const sig = `diff:${repaired.diffText.slice(0, 800)}`;
-                if (await this.stopIfRepeated(threadId, sig, "diff(repaired,repeated)"))
-                    return;
-                await this.autoApplyDiff(threadId, repaired.diffText);
-                return;
+                catch {
+                    return undefined;
+                }
+                return { kind: "toolcall", body };
             }
-        }
-        catch (e) {
-            this.debug("error", "autoProcessReply: repair failed", { error: e instanceof Error ? e.message : String(e) });
-        }
-        // 1. 检测是否是 toolplan
-        const toolplanMatch = /```toolplan\s*([\s\S]*?)```/m.exec(execText);
-        if (toolplanMatch) {
-            const planJson = toolplanMatch[1].trim();
-            this.debug("info", "autoProcessReply: detected toolplan, auto-executing");
-            try {
-                await this.runToolPlanAndGeneratePatch(threadId, planJson);
+            const mToolplan = /^```toolplan\s*([\s\S]*?)```$/.exec(s);
+            if (mToolplan) {
+                const body = String(mToolplan[1] || "").trim();
+                if (!body)
+                    return undefined;
+                try {
+                    const obj = JSON.parse(body);
+                    if (!Array.isArray(obj?.read))
+                        return undefined;
+                }
+                catch {
+                    return undefined;
+                }
+                return { kind: "toolplan", body };
             }
-            catch (e) {
-                this.debug("error", "autoProcessReply: toolplan execution failed", { error: e instanceof Error ? e.message : String(e) });
+            if (s.startsWith("diff --git ") && /\n--- /.test(s) && /\n\+\+\+ /.test(s)) {
+                return { kind: "diff", body: s };
             }
+            if (s.startsWith("{") && s.endsWith("}")) {
+                try {
+                    const obj = JSON.parse(s);
+                    if (Array.isArray(obj?.read))
+                        return { kind: "toolplan", body: s };
+                    const norm = normalizeLooseToolCall(obj);
+                    if (norm?.tool)
+                        return { kind: "toolcall", body: JSON.stringify({ tool: norm.tool, args: norm.args ?? {} }) };
+                }
+                catch {
+                    // ignore
+                }
+            }
+            return undefined;
+        };
+        const action = parseStrictAction(trimmed);
+        if (!action) {
+            this.debug("info", "autoProcessReply: no strict actionable content detected; skip auto-exec");
             return;
         }
-        // 1.5. 检测裸 JSON toolplan（没有 ``` 包裹）
-        const jsonMatch = /\{[\s\S]*?"read"\s*:\s*\[[\s\S]*?\][\s\S]*?\}/m.exec(execText);
-        if (jsonMatch) {
-            try {
-                const obj = JSON.parse(jsonMatch[0]);
-                if (Array.isArray(obj?.read)) {
-                    this.debug("info", "autoProcessReply: detected bare JSON toolplan, auto-executing");
-                    await this.runToolPlanAndGeneratePatch(threadId, jsonMatch[0]);
-                    return;
-                }
-            }
-            catch {
-                // 不是有效的 toolplan JSON，继续检查其他类型
-            }
-        }
-        // 2. 检测是否是 toolcall（支持 fenced + 裸/污染格式）
-        const callJson = (0, toolcall_1.extractToolCallJson)(execText);
-        if (callJson) {
-            this.debug("info", "autoProcessReply: detected toolcall, auto-executing");
-            try {
-                // 死循环判定：连续重复同一个 toolcall（归一化后）才停
-                const normalized = (0, toolcall_1.normalizeToolCallObject)(JSON.parse(callJson));
-                const sig = `toolcall:${normalized.tool}:${this.stableStringify(normalized.args)}`;
-                if (await this.stopIfRepeated(threadId, sig, "toolcall(repeated)"))
-                    return;
-                await this.runToolCallAndContinueAuto(threadId, callJson);
-            }
-            catch (e) {
-                this.debug("error", "autoProcessReply: toolcall execution failed", { error: e instanceof Error ? e.message : String(e) });
-            }
+        if (action.kind === "toolplan") {
+            await this.runToolPlanAndGeneratePatch(threadId, action.body);
             return;
         }
-        // 3. 检测 bash 命令（支持 fenced + UI 污染格式）
-        const bashCmd = (0, bash_1.extractBashBlock)(execText);
-        if (bashCmd) {
+        if (action.kind === "toolcall") {
+            const normalized = (0, toolcall_1.normalizeToolCallObject)(JSON.parse(action.body));
+            const sig = `toolcall:${normalized.tool}:${this.stableStringify(normalized.args)}`;
+            if (await this.stopIfRepeated(threadId, sig, "toolcall(strict,repeated)"))
+                return;
+            await this.runToolCallAndContinueAuto(threadId, action.body);
+            return;
+        }
+        if (action.kind === "bash") {
             if (this.readOnlyMode) {
                 await this.notifyInChat(threadId, "🔒 只读模式：检测到 bash，未自动执行。");
                 return;
             }
-            this.debug("info", "autoProcessReply: detected bash command, auto-executing", { cmd: bashCmd });
-            try {
-                const sig = `bash:${bashCmd.trim().slice(0, 500)}`;
-                if (await this.stopIfRepeated(threadId, sig, "bash(repeated)"))
-                    return;
-                await this.autoExecuteBash(threadId, bashCmd);
-            }
-            catch (e) {
-                this.debug("error", "autoProcessReply: bash execution failed", { error: e instanceof Error ? e.message : String(e) });
-            }
-            return;
-        }
-        // 4. 检测是否是 diff（支持 fenced ```diff ...``` 或裸 diff --git）
-        const fencedDiff = /```diff\s*([\s\S]*?)```/m.exec(execText);
-        const diffMatch = /(^|\n)(diff --git [\s\S]*)/m.exec(execText);
-        const diffText = fencedDiff ? (fencedDiff[1] || "").trim() : diffMatch ? diffMatch[2] : "";
-        if (diffText) {
-            if (this.readOnlyMode) {
-                await this.notifyInChat(threadId, "🔒 只读模式：检测到 diff，未自动应用。你可以点击消息里的「预览并应用补丁」手动确认。");
+            const sig = `bash:${action.body.trim().slice(0, 500)}`;
+            if (await this.stopIfRepeated(threadId, sig, "bash(strict,repeated)"))
                 return;
-            }
-            this.debug("info", "autoProcessReply: detected diff, auto-applying");
-            try {
-                const sig = `diff:${diffText.slice(0, 800)}`;
-                if (await this.stopIfRepeated(threadId, sig, "diff(repeated)"))
-                    return;
-                await this.autoApplyDiff(threadId, diffText);
-            }
-            catch (e) {
-                const errorMsg = e instanceof Error ? e.message : String(e);
-                this.debug("error", "autoProcessReply: diff apply failed", { error: errorMsg, retryCount });
-                // 如果还没重试过，自动重新请求 diff
-                if (retryCount < 2) {
-                    this.debug("info", "autoProcessReply: retrying diff generation", { retryCount: retryCount + 1 });
-                    await this.notifyInChat(threadId, `⚠️ 补丁应用失败：${errorMsg}，正在重新请求...`);
-                    await this.retryDiffGeneration(threadId, errorMsg, retryCount + 1, originUserText);
-                }
-                else {
-                    await this.notifyInChat(threadId, `❌ 补丁应用失败（已重试 ${retryCount} 次）：${errorMsg}`);
-                }
-            }
+            await this.autoExecuteBash(threadId, action.body);
             return;
         }
-        this.debug("info", "autoProcessReply: no actionable content detected");
+        const diffText = action.body;
+        if (this.readOnlyMode) {
+            await this.notifyInChat(threadId, "🔒 只读模式：检测到 diff，未自动应用。你可以点击消息里的「预览并应用补丁」手动确认。");
+            return;
+        }
+        this.debug("info", "autoProcessReply: detected strict diff, auto-applying");
+        try {
+            const sig = `diff:${diffText.slice(0, 800)}`;
+            if (await this.stopIfRepeated(threadId, sig, "diff(strict,repeated)"))
+                return;
+            await this.autoApplyDiff(threadId, diffText);
+        }
+        catch (e) {
+            const errorMsg = e instanceof Error ? e.message : String(e);
+            this.debug("error", "autoProcessReply: diff apply failed", { error: errorMsg, retryCount });
+            if (retryCount < 2) {
+                this.debug("info", "autoProcessReply: retrying diff generation", { retryCount: retryCount + 1 });
+                await this.notifyInChat(threadId, `⚠️ 补丁应用失败：${errorMsg}，正在重新请求...`);
+                await this.retryDiffGeneration(threadId, errorMsg, retryCount + 1, originUserText);
+            }
+            else {
+                await this.notifyInChat(threadId, `❌ 补丁应用失败（已重试 ${retryCount} 次）：${errorMsg}`);
+            }
+        }
     }
     /**
      * 自动执行 bash 命令
@@ -1276,6 +1278,7 @@ class DeepSeekViewProvider {
             "unsafe";
         // 分割多行命令
         const hasHereDoc = /(^|\s)<<\s*['"]?[A-Za-z0-9_]+['"]?/.test(bashCmd);
+        const hasCd = /(^|\n)\s*cd(\s|$)/m.test(bashCmd);
         let commands = (0, bash_1.splitBashCommands)(bashCmd);
         // 兜底：把“安全的 && 链”拆成多条命令，避免被安全策略拦截/误判为高风险
         // 典型：pwd && ls -la
@@ -1292,14 +1295,16 @@ class DeepSeekViewProvider {
                 .filter(Boolean);
             return parts.length >= 2 ? parts : [cmd];
         };
-        if (!hasHereDoc) {
+        if (!hasHereDoc && !hasCd) {
             const expanded = [];
             for (const c of commands)
                 expanded.push(...expandSafeAndChain(c));
             commands = expanded;
         }
+        // 支持 cd：当命令里包含 cd 时，必须作为一个整体脚本执行（否则逐条执行下 cd 不会保留）
+        const runAsBlock = hasHereDoc || hasCd;
         if (mode === "unsafe") {
-            const riskText = hasHereDoc ? bashCmd : commands.join("\n");
+            const riskText = runAsBlock ? bashCmd : commands.join("\n");
             const risk = (0, bash_1.assessBashRisk)(riskText);
             if (risk.level === "high") {
                 const pick = await vscode.window.showWarningMessage([
@@ -1327,18 +1332,31 @@ class DeepSeekViewProvider {
         const results = [];
         let allSuccess = true;
         let blocked = 0;
-        if (hasHereDoc) {
-            // HereDoc 需要整体作为脚本执行；逐行执行会把内容行当成命令跑
+        if (runAsBlock) {
+            // HereDoc / cd 都需要整体作为脚本执行（保持 shell 状态与工作目录）
             if (mode === "safe") {
-                const line = `⛔ 已拦截: (bash block)\n  原因: safe 模式下不允许 HereDoc/重定向`;
+                const line = `⛔ 已拦截: (bash block)\n  原因: safe 模式下不允许脚本块执行（例如包含 cd/HereDoc/重定向/复合语法）。请改用 relaxed/unsafe，或拆成不含 cd 的单条命令。`;
                 results.push(line);
                 blocked += 1;
                 allSuccess = false;
             }
             else {
                 // relaxed/unsafe：执行整个 block（仍保持 cwd=workspace root）
-                this.debug("info", "autoExecuteBash: executing heredoc block", { cwd, mode });
+                this.debug("info", "autoExecuteBash: executing bash block", { cwd, mode, hasHereDoc, hasCd });
                 try {
+                    // relaxed 模式仍按行做一次安全检查（避免管道/后台/命令替换等）
+                    if (mode === "relaxed") {
+                        const linesToCheck = (0, bash_1.splitBashCommands)(bashCmd);
+                        for (const line0 of linesToCheck) {
+                            const safety = (0, bash_1.checkBashCommandSafety)(line0, mode);
+                            if (!safety.ok) {
+                                blocked += 1;
+                                allSuccess = false;
+                                results.push(`⛔ 已拦截: (bash block)\n  原因: ${safety.reason}\n  命令: ${line0}`);
+                                return { summary: "⚠️ bash 已处理：脚本块被拦截（relaxed）", resultText: results.join("\n\n") };
+                            }
+                        }
+                    }
                     const { stdout, stderr } = await execFileAsync("bash", ["-lc", bashCmd], {
                         cwd,
                         timeout: 60000,
@@ -1357,14 +1375,6 @@ class DeepSeekViewProvider {
         else {
             for (const cmd of commands) {
                 this.debug("info", "autoExecuteBash: executing", { cmd, cwd });
-                // 强制拦截 cd：逐条执行下 cd 不会保留，会让用户以为“进入目录了”但实际没效果
-                if (/^\s*cd(\s|$)/.test(cmd)) {
-                    const line = `⛔ 已拦截: ${cmd}\n  原因: 不支持 cd（逐条执行不会保留目录切换）；请改用相对路径或拆成多条命令（例如 ls -la demo/）`;
-                    results.push(line);
-                    blocked += 1;
-                    allSuccess = false;
-                    continue;
-                }
                 const safety = (0, bash_1.checkBashCommandSafety)(cmd, mode);
                 if (!safety.ok) {
                     blocked += 1;
@@ -1415,6 +1425,11 @@ class DeepSeekViewProvider {
     async continueAfterBashAuto(threadId) {
         if (!(await this.tryConsumeAutoChain(threadId, "bash->continue")))
             return;
+        // 若“其他线程”正在忙，不要打断它；本线程内的自动链继续允许执行
+        if (this.isBusyOtherThread(threadId)) {
+            this.debug("warn", "continueAfterBashAuto: skip because busy(other thread)", { activeThreadId: this.active?.threadId });
+            return;
+        }
         const t = await this.store.getThread(threadId);
         const lastUser = t?.messages?.slice().reverse().find((m) => m.role === "user")?.text ?? "";
         const extra = [
@@ -1434,8 +1449,6 @@ class DeepSeekViewProvider {
         const assistantId = `assistant_${Date.now()}_${Math.random().toString(16).slice(2)}`;
         await this.store.addMessage(threadId, "assistant", "", assistantId);
         await this.pushState();
-        if (this.active?.abort)
-            this.active.abort.abort();
         const abort = new AbortController();
         this.active = { threadId, messageId: assistantId, abort, lastText: "" };
         try {
@@ -1487,8 +1500,10 @@ class DeepSeekViewProvider {
         const assistantId = `assistant_${Date.now()}_${Math.random().toString(16).slice(2)}`;
         await this.store.addMessage(threadId, "assistant", "", assistantId);
         await this.pushState();
-        if (this.active?.abort) {
-            this.active.abort.abort();
+        // 若“其他线程”正在忙，不要打断它；本线程内允许继续重试
+        if (this.isBusyOtherThread(threadId)) {
+            this.debug("warn", "retryDiffGeneration: skip because busy(other thread)", { activeThreadId: this.active?.threadId });
+            return;
         }
         const abort = new AbortController();
         this.active = { threadId, messageId: assistantId, abort, lastText: "" };
@@ -1558,6 +1573,11 @@ class DeepSeekViewProvider {
     async continueAfterDiffAuto(threadId) {
         if (!(await this.tryConsumeAutoChain(threadId, "diff->continue")))
             return;
+        // 若“其他线程”正在忙，不要打断它；本线程内的自动链继续允许执行
+        if (this.isBusyOtherThread(threadId)) {
+            this.debug("warn", "continueAfterDiffAuto: skip because busy(other thread)", { activeThreadId: this.active?.threadId });
+            return;
+        }
         const t = await this.store.getThread(threadId);
         const lastUser = t?.messages?.slice().reverse().find((m) => m.role === "user")?.text ?? "";
         const extra = [
@@ -1577,8 +1597,6 @@ class DeepSeekViewProvider {
         const assistantId = `assistant_${Date.now()}_${Math.random().toString(16).slice(2)}`;
         await this.store.addMessage(threadId, "assistant", "", assistantId);
         await this.pushState();
-        if (this.active?.abort)
-            this.active.abort.abort();
         const abort = new AbortController();
         this.active = { threadId, messageId: assistantId, abort, lastText: "" };
         try {
@@ -1636,6 +1654,11 @@ class DeepSeekViewProvider {
         await this.pushState();
         if (!(await this.tryConsumeAutoChain(threadId, "toolcall->continue")))
             return;
+        // 若“其他线程”正在忙，不要打断它；本线程内的自动链继续允许执行
+        if (this.isBusyOtherThread(threadId)) {
+            this.debug("warn", "runToolCallAndContinueAuto: skip because busy(other thread)", { activeThreadId: this.active?.threadId });
+            return;
+        }
         // 自动继续：让模型基于"工具结果"决定下一步
         const t = await this.store.getThread(threadId);
         const lastUser = t?.messages?.slice().reverse().find((m) => m.role === "user")?.text ?? "";
@@ -1662,10 +1685,6 @@ class DeepSeekViewProvider {
         const assistantId = `assistant_${Date.now()}_${Math.random().toString(16).slice(2)}`;
         await this.store.addMessage(threadId, "assistant", "", assistantId);
         await this.pushState();
-        if (this.active?.abort) {
-            this.debug("warn", "runToolCallAndContinueAuto: auto-cancel previous request");
-            this.active.abort.abort();
-        }
         const abort = new AbortController();
         this.active = { threadId, messageId: assistantId, abort, lastText: "" };
         try {
@@ -1864,9 +1883,9 @@ class DeepSeekViewProvider {
         const assistantId = `assistant_${Date.now()}_${Math.random().toString(16).slice(2)}`;
         await this.store.addMessage(threadId, "assistant", "", assistantId);
         await this.pushState();
-        if (this.active?.abort) {
-            this.debug("warn", "toolCallRun: auto-cancel previous request (continue)");
-            this.active.abort.abort();
+        if (this.isBusyOtherThread(threadId)) {
+            this.debug("warn", "toolCallRun: skip continue because busy(other thread)", { activeThreadId: this.active?.threadId });
+            return;
         }
         const abort = new AbortController();
         this.active = { threadId, messageId: assistantId, abort, lastText: "" };
@@ -1977,12 +1996,12 @@ class DeepSeekViewProvider {
                 </label>
               </div>
               <div class="composerBtns">
-                <button id="btn-send-chat" class="iconBtn iconBtnPrimary" title="发送">↑</button>
-                <button id="btn-cancel" class="iconBtn" title="停止" disabled>■</button>
-              </div>
-            </div>
+            <button id="btn-send-chat" class="iconBtn iconBtnPrimary" title="发送">↑</button>
+            <button id="btn-cancel" class="iconBtn" title="停止" disabled>■</button>
           </div>
         </div>
+      </div>
+      </div>
       </div>
     </section>
 

@@ -75,6 +75,7 @@
   let threads = [];
   let messages = [];
   let webContext = { bootstrapped: false, sentSnippetCount: 0 };
+  let isBusy = false;
   const pendingStream = Object.create(null); // messageId -> latest text
   const thoughtOpenState = Object.create(null); // messageId -> boolean (用户折叠/展开选择)
   const thoughtAutoFollow = Object.create(null); // messageId -> boolean (是否自动滚动跟随)
@@ -552,6 +553,15 @@
     return "";
   }
 
+  function setActionButtonsDisabled(disabled) {
+    try {
+      const btns = chatListEl.querySelectorAll(".msgActions button");
+      for (let i = 0; i < btns.length; i++) btns[i].disabled = !!disabled;
+    } catch {
+      // ignore
+    }
+  }
+
   function renderChat() {
     chatListEl.innerHTML = "";
     for (let idx = 0; idx < (messages || []).length; idx++) {
@@ -587,7 +597,9 @@
           const btn = document.createElement("button");
           btn.className = "btn btn-secondary";
           btn.textContent = "预览并应用补丁";
+          btn.disabled = !!isBusy;
           btn.addEventListener("click", () => {
+            if (isBusy) return;
             vscode.postMessage({ type: "applyPatchText", patchText: diffText });
           });
           actions.appendChild(btn);
@@ -599,7 +611,9 @@
           const btn = document.createElement("button");
           btn.className = "btn btn-secondary";
           btn.textContent = "确认工具计划：读取文件并继续生成 diff";
+          btn.disabled = !!isBusy;
           btn.addEventListener("click", () => {
+            if (isBusy) return;
             btn.disabled = true;
             toast("已确认工具计划，开始读取文件并生成 diff…");
             vscode.postMessage({ type: "toolPlanRun", planText: toolPlanText });
@@ -613,7 +627,9 @@
           const btn = document.createElement("button");
           btn.className = "btn btn-secondary";
           btn.textContent = "运行工具（本地）并继续";
+          btn.disabled = !!isBusy;
           btn.addEventListener("click", () => {
+            if (isBusy) return;
             btn.disabled = true;
             toast("开始运行本地工具…");
             vscode.postMessage({ type: "toolCallRun", callText: toolCallText });
@@ -627,7 +643,9 @@
           const btn = document.createElement("button");
           btn.className = "btn btn-secondary";
           btn.textContent = "确认并执行 bash";
+          btn.disabled = !!isBusy;
           btn.addEventListener("click", () => {
+            if (isBusy) return;
             btn.disabled = true;
             toast("开始执行 bash…");
             vscode.postMessage({ type: "bashRun", bashText });
@@ -648,6 +666,7 @@
     messages = payload.messages || [];
     webContext = payload.webContext || { bootstrapped: false, sentSnippetCount: 0 };
     renderChat();
+    setActionButtonsDisabled(isBusy);
     // 尝试把之前因“渲染竞态”丢掉的流式更新补上
     for (const id of Object.keys(pendingStream)) {
       updateMessageInDom(id, pendingStream[id]);
@@ -663,8 +682,10 @@
     }
     if (msg.type === "requestState") {
       const busy = !!msg.busy;
+      isBusy = busy;
       if (btnCancelEl) btnCancelEl.disabled = !busy;
       if (btnSendChatEl) btnSendChatEl.disabled = busy;
+      setActionButtonsDisabled(busy);
       return;
     }
     if (msg.type === "readOnlyState") {
