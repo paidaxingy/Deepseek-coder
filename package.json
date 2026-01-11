@@ -1,0 +1,106 @@
+{
+  "name": "deepseek-coder",
+  "version": "1.0.0",
+  "displayName": "Deepseek Coder",
+  "publisher": "local",
+  "description": "Deepseek Coder: VSCode 扩展（免 API），通过 Playwright 驱动 DeepSeek 网页版，并提供本地工具（读文件/应用 diff/执行 bash 等）。",
+  "main": "./dist/extension.js",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -p . -w",
+    "lint": "eslint .",
+    "test": "npm run compile && node dist/workspace/bash.test.js && node dist/workspace/toolcall.test.js",
+    "vscode:prepublish": "npm run compile",
+    "playwright:install": "npx --yes playwright install chromium",
+    "playwright:install-deps": "npx --yes playwright install-deps chromium",
+    "package": "npx --yes @vscode/vsce package"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:deepseekCoder.sidebarView",
+    "onCommand:deepseekCoder.applyPatchFromClipboard",
+    "onCommand:deepseekCoder.addSelectionToContext",
+    "onCommand:deepseekCoder.rollbackLastChange",
+    "onCommand:deepseekCoder.installPlaywrightChromium"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "deepseekCoder.applyPatchFromClipboard",
+        "title": "Deepseek Coder: 从剪贴板应用补丁（预览确认）"
+      },
+      {
+        "command": "deepseekCoder.addSelectionToContext",
+        "title": "Deepseek Coder: 将当前选区加入上下文"
+      },
+      {
+        "command": "deepseekCoder.rollbackLastChange",
+        "title": "Deepseek Coder: 回滚上一次改动"
+      },
+      {
+        "command": "deepseekCoder.installPlaywrightChromium",
+        "title": "Deepseek Coder: 安装 Playwright Chromium（首次使用）"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "deepseekCoder",
+          "title": "Deepseek Coder",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "deepseekCoder": [
+        {
+          "id": "deepseekCoder.sidebarView",
+          "name": "Deepseek Coder",
+          "type": "webview"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Deepseek Coder",
+      "properties": {
+        "deepseekCoder.autoOpenPlaywright": {
+          "type": "boolean",
+          "default": true,
+          "description": "打开侧边栏面板时自动打开 Playwright（复用已登录的持久化 profile；首次仍需你手动登录）"
+        },
+        "deepseekCoder.defaultDeepThink": {
+          "type": "boolean",
+          "default": false,
+          "description": "Playwright 发送前默认启用 DeepThink/深度思考（若页面能找到该开关）。"
+        },
+        "deepseekCoder.bashSafetyMode": {
+          "type": "string",
+          "enum": ["safe", "relaxed", "unsafe"],
+          "default": "unsafe",
+          "description": "bash 自动执行安全模式：safe(更严格，会拦截重定向/HereDoc) / relaxed(允许重定向/HereDoc，仍拦截部分高风险语法) / unsafe(不拦截；检测到高风险时会弹窗要求确认)"
+        }
+      }
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.3",
+    "@types/vscode": "^1.80.0",
+    "eslint": "^9.39.2",
+    "@eslint/js": "^9.39.0",
+    "typescript-eslint": "^8.46.1",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "diff": "^8.0.2",
+    "playwright": "^1.57.0"
+  }
+}

@@ -1,0 +1,14 @@
+**/.vscode/**
+**/.git/**
+**/.playwright-profile/**
+src/**
+*.ts
+tsconfig.json
+eslint.config.js
+package-lock.json
+
+# 发布版：不包含调试/测试文件
+test-*.js
+deepthink-debug.png
+
+
