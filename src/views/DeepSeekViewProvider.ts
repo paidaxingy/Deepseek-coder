@@ -9,11 +9,8 @@ import { applyPatchTextDirectly, applyPatchTextWithPreviewAndConfirm } from "../
 import { rollbackLast } from "../workspace/rollback";
 import { assessBashRisk, checkBashCommandSafety, extractBashBlock, splitBashCommands, type BashSafetyMode } from "../workspace/bash";
 import { extractToolCallJson, normalizeToolCallObject } from "../workspace/toolcall";
-import { exec, execFile } from "child_process";
-import { promisify } from "util";
-
-const execAsync = promisify(exec);
-const execFileAsync = promisify(execFile);
+import { spawn } from "child_process";
+import * as crypto from "crypto";
 
 type WebviewInbound =
   | { type: "ready" }
@@ -68,11 +65,24 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
   static readonly viewType = "deepseekCoder.sidebarView";
 
   private readonly WEB_PROMPT_SIGNATURE = "【Deepseek-Coder Prompt v2】";
+  // 防卡死：限制写入 webview state 的单段文本长度（messages/snippets 都会进入 state）。
+  // 过长的 bash/toolcall/readFile 输出会导致 postMessage 卡顿甚至卡死。
+  private readonly MAX_STATE_TEXT_CHARS = 60_000;
+  private readonly MAX_STATE_TEXT_HEAD = 30_000;
+  private readonly MAX_STATE_TEXT_TAIL = 20_000;
+  /**
+   * 只保存“提取后的用户意图”（而不是用户粘贴的整段大 prompt/日志），用于自动链继续时避免重复塞入历史内容。
+   * 由于 ThreadStore 是单会话内存态，这里也只做内存缓存即可。
+   */
+  private readonly lastUserIntent: Record<string, string> = Object.create(null);
+  private readonly lastUserIntentSig: Record<string, string> = Object.create(null);
+  private readonly lastUserIntentTs: Record<string, number> = Object.create(null);
 
   private _view?: vscode.WebviewView;
   private readonly store: ThreadStore;
   private currentThreadId?: string;
   private active?: { threadId: string; messageId: string; abort: AbortController; lastText: string };
+  private activeBash?: { threadId: string; messageId: string; abort: AbortController; kill?: () => void };
   private readonly output = vscode.window.createOutputChannel("Deepseek Coder");
   private readonly debugBuf: string[] = [];
   private readonly DEBUG_MAX = 300;
@@ -104,6 +114,130 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
     if (!s) return this.WEB_PROMPT_SIGNATURE;
     if (s.startsWith(this.WEB_PROMPT_SIGNATURE)) return s;
     return [this.WEB_PROMPT_SIGNATURE, "", s].join("\n");
+  }
+
+  private resetUserIntentCache(threadId: string) {
+    delete this.lastUserIntent[threadId];
+    delete this.lastUserIntentSig[threadId];
+    delete this.lastUserIntentTs[threadId];
+  }
+
+  private hashTextShort(s: string): string {
+    try {
+      return crypto.createHash("sha1").update(String(s || "")).digest("hex").slice(0, 12);
+    } catch {
+      // fallback：不依赖 crypto 的极简 hash
+      const str = String(s || "");
+      let h = 0;
+      for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) | 0;
+      return String(h >>> 0);
+    }
+  }
+
+  private normalizeUserText(s: string): string {
+    return String(s || "").replace(/\r\n/g, "\n").trim();
+  }
+
+  private truncateForState(text: string, title: string): string {
+    const s = String(text ?? "");
+    const n = s.length;
+    if (n <= this.MAX_STATE_TEXT_CHARS) return s;
+    const head = s.slice(0, Math.max(0, this.MAX_STATE_TEXT_HEAD));
+    const tail = s.slice(Math.max(0, n - this.MAX_STATE_TEXT_TAIL));
+    const note = [
+      `[已截断：${title}]`,
+      `原始长度：${n} chars`,
+      `已保留：head ${head.length} + tail ${tail.length}`,
+      "完整输出已写入「Deepseek Coder」输出面板。"
+    ].join("\n");
+    return [note, "", head, "", "…（中间内容已省略）…", "", tail].join("\n");
+  }
+
+  private writeLargeToOutput(title: string, text: string) {
+    try {
+      const s = String(text ?? "");
+      const n = s.length;
+      if (!s) return;
+      // OutputChannel 可承受较大输出；这里做个简单分隔，方便检索。
+      this.output.appendLine(`[${new Date().toISOString()}] ${title} (${n} chars)`);
+      this.output.appendLine(s);
+      this.output.appendLine("");
+    } catch {
+      // ignore
+    }
+  }
+
+  /**
+   * 目标：把用户“重复粘贴的 Prompt v2 + 日志 + 系统说明”压缩成“本次真正要解决的新增问题/报错”。
+   * 这样自动链 continue/retry 时不会反复把历史内容塞回 prompt，避免 DeepSeek 每步都重新分析同一大段。
+   */
+  private extractUserIntent(rawText: string): string {
+    const raw = this.normalizeUserText(rawText);
+    if (!raw) return "";
+
+    let s = raw;
+
+    // 如果用户把整段 web prompt 粘贴进来了：只从最后一次签名后开始取（避免重复段落）
+    const sigIdx = s.lastIndexOf(this.WEB_PROMPT_SIGNATURE);
+    if (sigIdx >= 0) {
+      s = s.slice(sigIdx + this.WEB_PROMPT_SIGNATURE.length).trim();
+    }
+
+    // 优先取最后一段“用户需求”块（Prompt v2 通常用这个标题）
+    try {
+      const reNeed = /^#?\s*用户需求\b.*$/gim;
+      let last: RegExpExecArray | null = null;
+      let m: RegExpExecArray | null;
+      while ((m = reNeed.exec(s))) last = m;
+      if (last) {
+        const lineEnd = s.indexOf("\n", last.index);
+        s = (lineEnd === -1 ? "" : s.slice(lineEnd + 1)).trim();
+      }
+    } catch {
+      // ignore
+    }
+
+    // 若仍包含“你的任务/补丁已应用”等系统性说明：截断，只保留用户这次要做的事
+    const cutMarkers = [
+      /^#\s*你的任务\b/m,
+      /^#\s*补丁已应用\b/m,
+      /^【选择规则】/m,
+      /^#\s*强制指令\b/m
+    ];
+    for (const re of cutMarkers) {
+      const mm = re.exec(s);
+      if (mm && mm.index >= 0) {
+        s = s.slice(0, mm.index).trim();
+      }
+    }
+
+    // 兜底：如果用户只贴了“补丁已应用/系统提示”，保证至少有点内容
+    if (!s) s = raw;
+
+    // 过长时只保留尾部（通常尾部才是最新报错）
+    const MAX = 8000;
+    if (s.length > MAX) s = s.slice(s.length - MAX);
+
+    s = s.replace(/\n{3,}/g, "\n\n").trim();
+    return s;
+  }
+
+  private isLikelyPastedWebPrompt(rawText: string): boolean {
+    const s = String(rawText || "");
+    if (!s) return false;
+    return s.includes(this.WEB_PROMPT_SIGNATURE) || /#\s*续写规则\b/i.test(s);
+  }
+
+  private async getLastUserIntent(threadId: string): Promise<string> {
+    const cached = this.lastUserIntent[threadId];
+    if (cached) return cached;
+    const t = await this.store.getThread(threadId);
+    const lastRaw = t?.messages?.slice().reverse().find((m) => m.role === "user")?.text ?? "";
+    const intent = this.extractUserIntent(lastRaw);
+    this.lastUserIntent[threadId] = intent;
+    this.lastUserIntentSig[threadId] = this.hashTextShort(intent);
+    this.lastUserIntentTs[threadId] = Date.now();
+    return intent;
   }
 
   private formatSnippetBlock(snippets: ContextSnippet[]): string {
@@ -387,21 +521,42 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
           case "chatSend": {
             const tid = await this.ensureThread();
             this.resetAutoChain(tid);
-            const userText = msg.userText?.trim() || "";
-            if (!userText) return;
+            const userTextRaw = msg.userText?.trim() || "";
+            if (!userTextRaw) return;
             this.deepThinkMode = !!msg.deepThink;
             // busy 时不自动中断：避免“操作快就自己中断”
             if (await this.rejectIfBusy("发送消息", tid)) return;
 
-            await this.store.addMessage(tid, "user", userText);
+            const intent = this.extractUserIntent(userTextRaw);
+            if (!intent) return;
+
+            // 同线程去重：当用户反复粘贴同一段 Prompt v2/日志时，直接忽略以避免模型反复分析历史内容
+            const intentSig = this.hashTextShort(intent);
+            const lastSig = this.lastUserIntentSig[tid];
+            const lastTs = this.lastUserIntentTs[tid] ?? 0;
+            if (this.isLikelyPastedWebPrompt(userTextRaw) && lastSig === intentSig && Date.now() - lastTs < 5 * 60 * 1000) {
+              await this.store.addMessage(
+                tid,
+                "system",
+                "⏭️ 检测到重复的用户需求（已忽略）：为避免 DeepSeek 反复分析同一段粘贴的历史内容。\n如需强制重发，请在末尾添加任意新字符。"
+              );
+              await this.pushState();
+              return;
+            }
+
+            // UI 里仍保留用户原始输入（便于回看），但后续 prompt/自动链都只使用 intent
+            await this.store.addMessage(tid, "user", userTextRaw);
+            this.lastUserIntent[tid] = intent;
+            this.lastUserIntentSig[tid] = intentSig;
+            this.lastUserIntentTs[tid] = Date.now();
             await this.pushState();
             // 统一策略：去掉“做项目/介绍项目/查环境”等特殊判断，永远走同一套 tooling prompt。
             // 让模型在 toolplan/toolcall/diff/bash/最终回答 中自选。
             // toolplan 的“强制指令”只在确实需要本地信息时启用，
             // 否则像“你好/今天星期几”这类会被误导强制输出 toolplan。
-            const needLocal = this.shouldAutoExecuteForUserText(userText);
+            const needLocal = this.shouldAutoExecuteForUserText(intent);
             const mode: "toolplan" | "patch" = needLocal && (msg.planFirst ?? false) ? "toolplan" : "patch";
-            const tooling = await this.buildToolingPromptForThread(tid, userText, mode);
+            const tooling = await this.buildToolingPromptForThread(tid, intent, mode);
             const prompt = tooling.prompt;
             const afterWebContext = tooling.after;
 
@@ -443,7 +598,7 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
               
               // 自动执行：不再基于 userText 猜测是否需要工具；由模型输出决定（非 toolplan/toolcall/diff/bash 将不会触发任何动作）
               try {
-                await this.autoProcessReply(tid, finalOut, 0, userText);
+                await this.autoProcessReply(tid, finalOut, 0, intent);
               } catch (e) {
                 this.debug("error", "autoProcessReply failed (ignored)", { error: e instanceof Error ? e.message : String(e) });
               }
@@ -521,15 +676,37 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
           case "chatCancel": {
             this.debug("warn", "user cancel");
             // 终止后续自动链（避免 diff->continue/toolcall->continue 继续跑）
-            if (this.active?.threadId) this.pauseAutoChain(this.active.threadId);
+            const tid = this.active?.threadId ?? this.activeBash?.threadId;
+            if (tid) this.pauseAutoChain(tid);
             this.active?.abort.abort();
+            // 终止正在执行的 bash（如果有）
+            if (this.activeBash) {
+              try {
+                this.activeBash.abort.abort();
+                this.activeBash.kill?.();
+              } catch {
+                // ignore
+              }
+              try {
+                await this.store.updateMessageText(
+                  this.activeBash.threadId,
+                  this.activeBash.messageId,
+                  ["[bash 已停止]", "", "用户手动停止了正在执行的 bash。"].join("\n")
+                );
+                await this.pushState();
+              } catch {
+                // ignore
+              } finally {
+                this.activeBash = undefined;
+              }
+            }
             try {
               await this.deepseek.stopGenerating((e) => this.debug(e.level, `stopGenerating: ${e.msg}`, e.data));
             } catch {
               // ignore
             }
             // 不用 VSCode 弹窗，直接在对话里提示
-            if (this.active?.threadId) await this.notifyInChat(this.active.threadId, "⏹️ 已停止：终止自动链，并尝试停止网页端生成。");
+            if (tid) await this.notifyInChat(tid, "⏹️ 已停止：终止自动链，并尝试停止网页端生成/本地 bash。");
             this.setBusy(false);
             return;
           }
@@ -584,6 +761,7 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
             this.currentThreadId = undefined;
             await this.ensureThread();
             this.resetAutoChain(this.currentThreadId!);
+            this.resetUserIntentCache(this.currentThreadId!);
             await this.pushState();
             return;
           }
@@ -592,6 +770,7 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
             this.currentThreadId = undefined;
             await this.ensureThread();
             this.resetAutoChain(this.currentThreadId!);
+            this.resetUserIntentCache(this.currentThreadId!);
             await this.pushState();
             return;
           }
@@ -608,6 +787,7 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
             this.currentThreadId = undefined;
             await this.ensureThread();
             this.resetAutoChain(this.currentThreadId!);
+            this.resetUserIntentCache(this.currentThreadId!);
             await this.pushState();
             return;
           }
@@ -624,6 +804,7 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
             this.currentThreadId = undefined;
             await this.ensureThread();
             this.resetAutoChain(this.currentThreadId!);
+            this.resetUserIntentCache(this.currentThreadId!);
             await this.pushState();
             return;
           }
@@ -724,6 +905,10 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
     this.autoChainPaused[threadId] = true;
   }
 
+  private buildNeutralContinueUserText(): string {
+    return "继续（不要复述之前的用户需求/提示词；已解决的问题直接跳过；只基于最新上下文片段/工具结果推进；若你确认已完成，请输出“最终回答”（不要任何代码块）以结束自动链）。";
+  }
+
   private shouldAutoExecuteForUserText(userText: string): boolean {
     const t = String(userText || "").trim();
     if (!t) return false;
@@ -777,6 +962,64 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
       }
     }
     return "";
+  }
+
+  private extractFirstJsonValueFrom(text: string, startIdx: number): string {
+    const s = String(text || "");
+    let i = Math.max(0, startIdx | 0);
+    while (i < s.length && s[i] !== "{" && s[i] !== "[") i++;
+    if (i >= s.length) return "";
+
+    const open = s[i];
+    const close = open === "[" ? "]" : "}";
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    for (let j = i; j < s.length; j++) {
+      const ch = s[j];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === "\\") esc = true;
+        else if (ch === "\"") inStr = false;
+        continue;
+      }
+      if (ch === "\"") {
+        inStr = true;
+        continue;
+      }
+      if (ch === open) depth++;
+      if (ch === close) {
+        depth--;
+        if (depth === 0) return s.slice(i, j + 1);
+      }
+    }
+    return "";
+  }
+
+  private normalizeToolPlanJson(plan: unknown): { read: string[]; notes: string } {
+    // 新格式：{"read":["a","b"],"notes":"..."}
+    if (plan && typeof plan === "object" && !Array.isArray(plan)) {
+      const p: any = plan as any;
+      const read = Array.isArray(p?.read) ? p.read.filter((x: any) => typeof x === "string") : [];
+      const notes = typeof p?.notes === "string" ? p.notes : "";
+      return { read, notes };
+    }
+
+    // 兼容旧格式：toolplan [ {type:"readFile", path:"xx"} , ... ]
+    if (Array.isArray(plan)) {
+      const read: string[] = [];
+      for (const item of plan) {
+        if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+        const t = String((item as any).type ?? "").trim();
+        const p = (item as any).path ?? (item as any).file ?? (item as any).filepath;
+        if (typeof p !== "string" || !p.trim()) continue;
+        if (!/^readfile$/i.test(t) && !/^read_file$/i.test(t) && !/^listdir$/i.test(t) && !/^list_dir$/i.test(t)) continue;
+        read.push(p.trim());
+      }
+      return { read, notes: "（已从旧版 toolplan 数组格式自动转换）" };
+    }
+
+    return { read: [], notes: "" };
   }
 
   private normalizeTextToLines(text: string): string[] {
@@ -1000,6 +1243,8 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
         "- 重要：生成/修改任何源代码文件时，文件内容里**禁止出现 markdown fence**（``` 或 ```python 等）；也不要输出补丁元行 `\\ No newline at end of file`",
         "- 重要：所有文本文件请确保以换行符结尾（文件末尾必须有 \\n），避免补丁应用时上下文不匹配",
         "- 重要：当你选择输出 toolplan/toolcall/diff/bash 时，必须把内容放在对应的 markdown 代码块里，并且整个回复**只能包含这一个代码块**（代码块外一个字都不许有）",
+        "- 重要：禁止输出 DeepSeek 网页 UI 噪音（Copy/Download/text/Reading/Read N web pages/Search 等），也不要把这些词粘进 diff/toolcall 里",
+        "- 重要：禁止在 diff 代码块外额外输出一行 \"diff\"（必须让 diff 代码块的第一行直接是 diff --git）",
         "",
         "# Claude Code 风格的行为准则（必须遵守）",
         "- 优先最小动作：能直接回答就不要调用工具",
@@ -1028,7 +1273,7 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
         "【重要】整个回复只能包含这一个 ```toolcall``` 代码块；代码块外不能有任何文字！",
         "【重要】searchText 必须提供非空 query；glob 可选（如 \"**/*.{ts,tsx}\"）",
         "【重要】toolcall JSON 的顶层字段只能是 tool 和 args（不要输出 type/command/file_path/content 这类字段）。",
-        "【禁止】不要输出这种自造格式：{\"searchText\":{...}}（顶层 key=工具名）。必须是 {\"tool\":\"searchText\",\"args\":{...}}。",
+        "【允许但不推荐】如果你必须一次做多个工具：可以输出一个 JSON，对应多个工具名 key，例如 {\"readFile\":{...},\"searchText\":{...}}（仍然必须放在同一个 ```toolcall``` 代码块里，且代码块外不能有任何文字）。",
         "",
         "## 格式 C: unified diff（修改代码时使用）",
         "必须输出一个 markdown 代码块，语言标识为 `diff`，代码块内是 unified diff：",
@@ -1041,10 +1286,12 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
         "-删除的行",
         "+新增的行",
         "```",
-        "【重要】只能输出这一个 ```diff``` 代码块；代码块外不能有任何文字！（禁止输出裸 diff，必须放进 ```diff 代码块）",
+        "【重要】只能输出这一个 ```diff``` 代码块；代码块外不能有任何文字！（禁止输出裸 diff，也禁止在代码块外单独输出一行 diff）",
+        "【重要】diff 代码块里第一行必须是 `diff --git ...`（不能出现 `diffCopyDownload...` / `diff Copy Download ...` / `text` 等污染行）。",
         "【重要】凡是“写代码/生成文件/修改文件内容”，必须使用 diff；禁止用 bash 的 cat/echo/heredoc 去写入源代码。",
         "【重要】每次只能修改/新增 **一个文件**：一个 diff 代码块里只允许出现 **一段** `diff --git a/... b/...`（不要把多个文件的 diff 拼在一起）。",
         "【重要】如果需要修改多个文件：请分多轮输出；每轮只输出一个文件的 diff，等待系统应用并继续追问后，再输出下一个文件的 diff。",
+        "【禁止】不要在 diff 代码块里嵌入任何 markdown 代码块（例如 ```bash/```json 等），也不要输出 ``` 这类 fence 行。",
         "",
         "## 格式 D: bash（需要执行 Linux 命令时使用，如删除文件、安装依赖等）",
         "输出一个 markdown 代码块，语言标识为 `bash`：",
@@ -1170,28 +1417,44 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
     // 目的：避免模型回显我们发送的提示词（里面包含示例 ```diff/toolcall/toolplan```）导致误触发执行。
     type StrictAction =
       | { kind: "diff"; body: string }
+      | { kind: "diffBatch"; body: string }
       | { kind: "bash"; body: string }
       | { kind: "toolcall"; body: string }
+      | { kind: "toolcallBatch"; body: string }
       | { kind: "toolplan"; body: string };
 
     // 兼容模型“自造”的 toolcall 结构：
     // - 标准：{"tool":"searchText","args":{...}}
     // - 变体：{"searchText":{...}}（顶层 key=tool，value=args）
-    const normalizeLooseToolCall = (obj: any): { tool: string; args: any } | undefined => {
-      if (!obj || typeof obj !== "object") return undefined;
-      if (typeof obj.tool === "string" && obj.tool.trim()) {
-        return { tool: String(obj.tool), args: obj.args ?? {} };
+    // - 批量：{"readFile":{...},"searchText":{...}}（多个工具，按顺序执行）
+    const normalizeLooseToolCalls = (obj: any): Array<{ tool: string; args: any }> => {
+      if (!obj || typeof obj !== "object") return [];
+      // 标准
+      if (typeof (obj as any).tool === "string" && String((obj as any).tool).trim()) {
+        return [{ tool: String((obj as any).tool), args: (obj as any).args ?? {} }];
       }
-      // 变体：顶层只有一个 key，且 value 是 object
+
+      // 变体/批量：顶层 key=工具名
+      const allowed = new Set(["listDir", "readFile", "searchText"]);
+      const calls: Array<{ tool: string; args: any }> = [];
       const keys = Object.keys(obj);
-      if (keys.length === 1) {
-        const k = keys[0];
-        const v = obj[k];
-        if (typeof k === "string" && k.trim() && v && typeof v === "object" && !Array.isArray(v)) {
-          return { tool: k, args: v };
-        }
+      // 固定顺序：先读/列，再搜，避免“先搜再读”导致重复
+      const order = ["readFile", "listDir", "searchText"];
+      const sorted = keys.slice().sort((a, b) => {
+        const ia = order.indexOf(a);
+        const ib = order.indexOf(b);
+        if (ia === -1 && ib === -1) return a.localeCompare(b);
+        if (ia === -1) return 1;
+        if (ib === -1) return -1;
+        return ia - ib;
+      });
+      for (const k of sorted) {
+        if (!allowed.has(k)) continue;
+        const v = (obj as any)[k];
+        if (!v || typeof v !== "object" || Array.isArray(v)) continue;
+        calls.push({ tool: k, args: v });
       }
-      return undefined;
+      return calls;
     };
 
     const parseStrictAction = (s0: string): StrictAction | undefined => {
@@ -1208,8 +1471,9 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
         if (json) {
           try {
             const obj = JSON.parse(json);
-            const norm = normalizeLooseToolCall(obj);
-            if (norm?.tool) return { kind: "toolcall", body: JSON.stringify({ tool: norm.tool, args: norm.args ?? {} }) };
+            const calls = normalizeLooseToolCalls(obj);
+            if (calls?.length === 1) return { kind: "toolcall", body: JSON.stringify({ tool: calls[0].tool, args: calls[0].args ?? {} }) };
+            if (calls?.length > 1) return { kind: "toolcallBatch", body: JSON.stringify({ calls }) };
           } catch {
             // ignore
           }
@@ -1217,11 +1481,14 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
       }
       const idxToolplan = lower.lastIndexOf("toolplan");
       if (idxToolplan !== -1) {
-        const json = this.extractFirstJsonObjectFrom(s, idxToolplan);
+        const json = this.extractFirstJsonValueFrom(s, idxToolplan);
         if (json) {
           try {
             const obj = JSON.parse(json);
-            if (Array.isArray(obj?.read)) return { kind: "toolplan", body: json.trim() };
+            const norm = this.normalizeToolPlanJson(obj);
+            if (Array.isArray(norm?.read) && norm.read.length > 0) {
+              return { kind: "toolplan", body: JSON.stringify(norm) };
+            }
           } catch {
             // ignore
           }
@@ -1233,6 +1500,19 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
         const body = String(mDiff[1] || "").trim();
         if (!body.startsWith("diff --git ")) return undefined;
         return { kind: "diff", body };
+      }
+      // 多个连续 diff 代码块：允许整条回复只由多个 ```diff``` 组成
+      const diffBlocks = Array.from(s.matchAll(/```diff\s*([\s\S]*?)```/g));
+      if (diffBlocks.length >= 2) {
+        const stripped = s.replace(/```diff\s*[\s\S]*?```/g, "").trim();
+        if (!stripped) {
+          const diffs = diffBlocks
+            .map((m) => String(m[1] || "").trim())
+            .filter((x) => x.startsWith("diff --git "));
+          if (diffs.length === diffBlocks.length) {
+            return { kind: "diffBatch", body: JSON.stringify({ diffs }) };
+          }
+        }
       }
       const mBash = /^```(?:bash|sh|shell)\s*([\s\S]*?)```$/.exec(s);
       if (mBash) {
@@ -1246,11 +1526,14 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
         if (!body) return undefined;
         try {
           const obj = JSON.parse(body);
-          if (typeof obj?.tool !== "string" || !obj.tool) return undefined;
+          if (typeof obj?.tool === "string" && obj.tool) return { kind: "toolcall", body: JSON.stringify(obj) };
+          const calls = normalizeLooseToolCalls(obj);
+          if (calls?.length === 1) return { kind: "toolcall", body: JSON.stringify({ tool: calls[0].tool, args: calls[0].args ?? {} }) };
+          if (calls?.length > 1) return { kind: "toolcallBatch", body: JSON.stringify({ calls }) };
+          return undefined;
         } catch {
           return undefined;
-        }
-        return { kind: "toolcall", body };
+    }
       }
       const mToolplan = /^```toolplan\s*([\s\S]*?)```$/.exec(s);
       if (mToolplan) {
@@ -1258,23 +1541,26 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
         if (!body) return undefined;
         try {
           const obj = JSON.parse(body);
-          if (!Array.isArray(obj?.read)) return undefined;
+          const norm = this.normalizeToolPlanJson(obj);
+          if (!Array.isArray(norm?.read) || norm.read.length === 0) return undefined;
+          return { kind: "toolplan", body: JSON.stringify(norm) };
         } catch {
           return undefined;
         }
-        return { kind: "toolplan", body };
       }
 
       if (s.startsWith("diff --git ") && /\n--- /.test(s) && /\n\+\+\+ /.test(s)) {
         return { kind: "diff", body: s };
       }
 
-      if (s.startsWith("{") && s.endsWith("}")) {
+      if ((s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"))) {
         try {
           const obj = JSON.parse(s);
-          if (Array.isArray(obj?.read)) return { kind: "toolplan", body: s };
-          const norm = normalizeLooseToolCall(obj);
-          if (norm?.tool) return { kind: "toolcall", body: JSON.stringify({ tool: norm.tool, args: norm.args ?? {} }) };
+          const normPlan = this.normalizeToolPlanJson(obj);
+          if (Array.isArray(normPlan?.read) && normPlan.read.length > 0) return { kind: "toolplan", body: JSON.stringify(normPlan) };
+          const calls = normalizeLooseToolCalls(obj);
+          if (calls?.length === 1) return { kind: "toolcall", body: JSON.stringify({ tool: calls[0].tool, args: calls[0].args ?? {} }) };
+          if (calls?.length > 1) return { kind: "toolcallBatch", body: JSON.stringify({ calls }) };
         } catch {
           // ignore
         }
@@ -1284,14 +1570,52 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
 
     const action = parseStrictAction(trimmed);
     if (!action) {
+      // 常见违规输出：多文件 diff / toolplan+diff 混合 / 旧 toolplan 数组格式
+      const maybeMultiDiff = (() => {
+        const m = trimmed.match(/^diff --git /gm);
+        return (m?.length ?? 0) >= 2;
+      })();
+      const maybeMixedToolplanAndDiff = /\btoolplan\b/i.test(trimmed) && /(^|\n)diff --git /m.test(trimmed);
+      const maybeLegacyToolplanArray = /\btoolplan\b/i.test(trimmed) && /\[\s*\{\s*"type"\s*:\s*"readFile"/i.test(trimmed);
+      const maybeDiffWithUiNoise = /(diff\s*Copy\s*Download\s*diff\s*--git|diffCopyDownloaddiff\s*--git)/i.test(trimmed);
+      const maybeHasStandaloneTextNoise = /(^|\n)\s*text\s*($|\n)/i.test(trimmed);
+      const maybeHasStandaloneDiffLabel = /(^|\n)\s*diff\s*($|\n)\s*diff --git /i.test(trimmed);
+
+      if (maybeMultiDiff || maybeMixedToolplanAndDiff || maybeLegacyToolplanArray || maybeDiffWithUiNoise || maybeHasStandaloneTextNoise || maybeHasStandaloneDiffLabel) {
+        const sig = `formatfix:${this.hashTextShort(trimmed.slice(0, 2000))}`;
+        if (!(await this.stopIfRepeated(threadId, sig, "formatfix(repeated)"))) {
+          await this.notifyInChat(
+            threadId,
+            [
+              "⚠️ 检测到 DeepSeek 回复不符合“单块/单文件”规则，已暂停自动执行。",
+              "我会自动请求它按规则重写（只输出一个 toolplan 或一个单文件 diff）。"
+            ].join("\n")
+          );
+          const reason = maybeMultiDiff
+            ? "你输出了多个文件的 diff（出现了多个 `diff --git`）。每次只能输出一个文件的 diff。"
+            : maybeMixedToolplanAndDiff
+              ? "你把 toolplan 和 diff 混在同一条回复里了。一次只能输出一种动作块。"
+              : maybeLegacyToolplanArray
+                ? "你使用了旧版 toolplan 数组格式。toolplan 必须是 {\"read\":[...],\"notes\":\"\"}。"
+                : maybeDiffWithUiNoise
+                  ? "你的 diff 被 DeepSeek 网页 UI 文本污染（Copy/Download 粘连），必须清理后只输出 `diff --git` 开头的内容。"
+                  : maybeHasStandaloneTextNoise
+                    ? "你输出了无关的 `text` 噪音行。回复里禁止出现这种 UI 标签行。"
+                    : "你在 diff 代码块外额外输出了单独一行 `diff`。diff 代码块第一行必须直接是 `diff --git`。";
+
+          await this.requestStrictReformat(threadId, trimmed, reason);
+      }
+        return;
+      }
+
       this.debug("info", "autoProcessReply: no strict actionable content detected; skip auto-exec");
-      return;
-    }
+        return;
+      }
 
     if (action.kind === "toolplan") {
       await this.runToolPlanAndGeneratePatch(threadId, action.body);
           return;
-    }
+        }
 
     if (action.kind === "toolcall") {
       const normalized = normalizeToolCallObject(JSON.parse(action.body));
@@ -1301,16 +1625,83 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    if (action.kind === "toolcallBatch") {
+      let calls: Array<{ tool: string; args: any }> = [];
+      try {
+        const obj = JSON.parse(action.body);
+        calls = Array.isArray(obj?.calls) ? obj.calls : [];
+      } catch {
+        calls = [];
+      }
+      const cleaned = calls
+        .filter((c) => c && typeof c.tool === "string" && c.tool)
+        .map((c) => normalizeToolCallObject({ tool: c.tool, args: c.args ?? {} }));
+      const sig = `toolcallBatch:${this.stableStringify(cleaned)}`;
+      if (await this.stopIfRepeated(threadId, sig, "toolcallBatch(strict,repeated)")) return;
+      await this.runToolCallBatchAndContinueAuto(threadId, cleaned as any);
+      return;
+    }
+
     if (action.kind === "bash") {
       if (this.readOnlyMode) {
         await this.notifyInChat(threadId, "🔒 只读模式：检测到 bash，未自动执行。");
-        return;
-      }
+          return;
+        }
       const sig = `bash:${action.body.trim().slice(0, 500)}`;
       if (await this.stopIfRepeated(threadId, sig, "bash(strict,repeated)")) return;
       await this.autoExecuteBash(threadId, action.body);
       return;
     }
+
+    if (action.kind === "diffBatch") {
+      let diffs: string[] = [];
+      try {
+        const obj = JSON.parse(action.body);
+        diffs = Array.isArray(obj?.diffs) ? obj.diffs.map((x: any) => String(x ?? "")).filter(Boolean) : [];
+      } catch {
+        diffs = [];
+      }
+      if (!diffs.length) return;
+
+      if (this.readOnlyMode) {
+        await this.notifyInChat(threadId, "🔒 只读模式：检测到 diff，未自动应用。你可以点击消息里的「预览并应用补丁」手动确认。");
+        return;
+      }
+
+      if (diffs.length > 6) {
+        await this.notifyInChat(threadId, `⚠️ 检测到连续 ${diffs.length} 个 diff 代码块：为避免误操作，请让 DeepSeek 分多轮（每轮 1 个文件）重写。`);
+        const sig = `diffBatchTooMany:${this.hashTextShort(action.body.slice(0, 2000))}`;
+        if (!(await this.stopIfRepeated(threadId, sig, "diffBatch(tooMany,repeated)"))) {
+          await this.requestStrictReformat(
+            threadId,
+            diffs.slice(0, 2).join("\n\n"),
+            `你输出了多个 diff 代码块（${diffs.length} 个）。请分多轮，每轮只输出一个文件的 diff（一个 \`\`\`diff\`\`\` 代码块）。`
+          );
+      }
+      return;
+    }
+
+      for (let i = 0; i < diffs.length; i++) {
+        const d = diffs[i];
+        const count = (d.match(/^diff --git /gm) || []).length;
+        if (count >= 2) {
+          await this.notifyInChat(threadId, "⚠️ 检测到某个 diff 代码块包含多个文件：已拦截并请求按单文件重写。");
+          const sig = `diffBatchMultiFile:${this.hashTextShort(d.slice(0, 2000))}`;
+          if (!(await this.stopIfRepeated(threadId, sig, "diffBatch(multifile,repeated)"))) {
+            await this.requestStrictReformat(
+              threadId,
+              d,
+              `你的某个 diff 代码块包含多个文件（出现了 ${count} 段 diff --git）。请拆成多轮，每轮只输出一个文件的 diff。`
+            );
+          }
+          return;
+        }
+        await this.autoApplyDiff(threadId, d, { continueAfter: i === diffs.length - 1 });
+      }
+      return;
+    }
+
+    if (action.kind !== "diff") return;
 
     const diffText = action.body;
     if (this.readOnlyMode) {
@@ -1318,11 +1709,31 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    // 强制：单文件 diff（一个 diff 里只能有一段 diff --git）
+    const diffCount = (diffText.match(/^diff --git /gm) || []).length;
+    if (diffCount >= 2) {
+      const files = Array.from(diffText.matchAll(/^diff --git a\/(\S+)\s+b\/(\S+)/gm))
+        .map((m) => m[2] || m[1])
+        .filter(Boolean)
+        .slice(0, 10);
+      const head = files.length ? `（检测到：${files.join(", ")}）` : "";
+      await this.notifyInChat(threadId, `⚠️ 检测到多文件 diff，已拦截自动应用${head}。我会请求 DeepSeek 按“单文件 diff”重写。`);
+      const sig = `multidiff:${this.hashTextShort(diffText.slice(0, 2000))}`;
+      if (!(await this.stopIfRepeated(threadId, sig, "diff(multifile,repeated)"))) {
+        await this.requestStrictReformat(
+          threadId,
+          diffText,
+          `你输出了多文件 diff（出现了 ${diffCount} 段 diff --git）。请只输出其中一个文件的 diff（推荐先输出 ${files[0] ?? "第一个文件"}），且回复只能包含一个 \`\`\`diff\`\`\` 代码块。`
+        );
+      }
+      return;
+    }
+
     this.debug("info", "autoProcessReply: detected strict diff, auto-applying");
       try {
         const sig = `diff:${diffText.slice(0, 800)}`;
       if (await this.stopIfRepeated(threadId, sig, "diff(strict,repeated)")) return;
-        await this.autoApplyDiff(threadId, diffText);
+      await this.autoApplyDiff(threadId, diffText, { continueAfter: true });
       } catch (e) {
         const errorMsg = e instanceof Error ? e.message : String(e);
         this.debug("error", "autoProcessReply: diff apply failed", { error: errorMsg, retryCount });
@@ -1333,7 +1744,8 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
         } else {
           await this.notifyInChat(threadId, `❌ 补丁应用失败（已重试 ${retryCount} 次）：${errorMsg}`);
         }
-      }
+    }
+
   }
 
   /**
@@ -1420,6 +1832,147 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
       }
     }
     
+    const BASH_STREAM_FULL_CAP = 2_000_000; // 仅用于内存拼接，完整内容始终写入 OutputChannel
+    const BASH_STREAM_UPDATE_MS = 250; // 节流：避免频繁 pushState 卡 UI
+
+    const bashMsgId = `system_bash_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    const bashAbort = new AbortController();
+    this.activeBash = { threadId, messageId: bashMsgId, abort: bashAbort, kill: undefined };
+    let fullText = "";
+    let fullTruncated = false;
+    let lastUpdateAt = 0;
+    let scheduled: NodeJS.Timeout | undefined;
+    let lastShown = "";
+
+    const outTs = new Date().toISOString();
+    this.output.appendLine(`[${outTs}] [bash] stream start (${threadId})`);
+    this.output.appendLine(bashCmd);
+    this.output.appendLine("");
+
+    const appendToBuffers = (s: string) => {
+      if (!s) return;
+      // OutputChannel：永远写全量
+      try {
+        this.output.append(s);
+      } catch {
+        // 旧版本没有 append 也没关系：退化到 appendLine（可能多换行）
+        this.output.appendLine(String(s));
+      }
+
+      // 内存：只保留上限，用于聊天/上下文（仍会再做 truncateForState）
+      if (fullText.length < BASH_STREAM_FULL_CAP) {
+        const remain = BASH_STREAM_FULL_CAP - fullText.length;
+        fullText += s.length <= remain ? s : s.slice(0, remain);
+        if (s.length > remain && !fullTruncated) {
+          fullTruncated = true;
+          fullText += "\n...[output truncated in memory; see OutputChannel for full]...\n";
+        }
+      } else if (!fullTruncated) {
+        fullTruncated = true;
+        fullText += "\n...[output truncated in memory; see OutputChannel for full]...\n";
+      }
+    };
+
+    const scheduleStateUpdate = async (force = false) => {
+      const now = Date.now();
+      if (!force && now - lastUpdateAt < BASH_STREAM_UPDATE_MS) {
+        if (!scheduled) {
+          scheduled = setTimeout(() => {
+            scheduled = undefined;
+            void scheduleStateUpdate(false);
+          }, BASH_STREAM_UPDATE_MS);
+        }
+        return;
+      }
+      lastUpdateAt = now;
+      const shown = this.truncateForState(fullText, "bash 执行中");
+      const nextText = ["[bash 执行中]", "", shown].join("\n");
+      if (nextText === lastShown) return;
+      lastShown = nextText;
+      await this.store.updateMessageText(threadId, bashMsgId, nextText);
+      await this.pushState();
+    };
+
+    await this.store.addMessage(threadId, "system", ["[bash 执行中]", "", this.truncateForState(bashCmd, "bash 命令")].join("\n"), bashMsgId);
+    await this.pushState();
+
+    const runBashStreaming = async (cmd: string): Promise<{ ok: boolean; exitCode: number | null; error?: string }> => {
+      return await new Promise((resolve) => {
+        if (bashAbort.signal.aborted) {
+          return resolve({ ok: false, exitCode: null, error: "已停止" });
+        }
+        const child = spawn("bash", ["-lc", cmd], {
+          cwd,
+          env: process.env,
+          detached: true
+        });
+
+        let done = false;
+        const finish = (res: { ok: boolean; exitCode: number | null; error?: string }) => {
+          if (done) return;
+          done = true;
+          resolve(res);
+        };
+
+        const killTree = () => {
+          try {
+            if (child.pid) process.kill(-child.pid, "SIGKILL");
+          } catch {
+            try {
+              child.kill("SIGKILL");
+            } catch {
+              // ignore
+            }
+          }
+        };
+        // 让“停止”按钮能杀掉当前子进程组
+        if (this.activeBash && this.activeBash.threadId === threadId && this.activeBash.messageId === bashMsgId) {
+          this.activeBash.kill = killTree;
+        }
+
+        const onAbort = () => {
+          appendToBuffers(`\n[stopped] killed by user\n`);
+          killTree();
+          finish({ ok: false, exitCode: null, error: "已停止" });
+        };
+        bashAbort.signal.addEventListener("abort", onAbort, { once: true });
+
+        // 默认超时放宽（开发服务器/长任务需要手动停止）
+        const timer = setTimeout(() => {
+          appendToBuffers(`\n[timeout] exceeded 30min; killing process\n`);
+          killTree();
+          finish({ ok: false, exitCode: null, error: "超时（30min）" });
+        }, 30 * 60_000);
+
+        child.stdout?.on("data", (buf) => {
+          appendToBuffers(String(buf));
+          void scheduleStateUpdate(false);
+        });
+        child.stderr?.on("data", (buf) => {
+          appendToBuffers(String(buf));
+          void scheduleStateUpdate(false);
+        });
+        child.on("error", (e) => {
+          clearTimeout(timer);
+          try {
+            bashAbort.signal.removeEventListener("abort", onAbort);
+          } catch {
+            // ignore
+          }
+          finish({ ok: false, exitCode: null, error: e instanceof Error ? e.message : String(e) });
+        });
+        child.on("close", (code) => {
+          clearTimeout(timer);
+          try {
+            bashAbort.signal.removeEventListener("abort", onAbort);
+          } catch {
+            // ignore
+          }
+          finish({ ok: code === 0, exitCode: code ?? null });
+        });
+      });
+    };
+    
     const results: string[] = [];
     let allSuccess = true;
     let blocked = 0;
@@ -1431,6 +1984,8 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
         results.push(line);
         blocked += 1;
         allSuccess = false;
+        appendToBuffers(`${line}\n\n`);
+        await scheduleStateUpdate(true);
       } else {
         // relaxed/unsafe：执行整个 block（仍保持 cwd=workspace root）
         this.debug("info", "autoExecuteBash: executing bash block", { cwd, mode, hasHereDoc, hasCd });
@@ -1444,21 +1999,24 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
                 blocked += 1;
                 allSuccess = false;
                 results.push(`⛔ 已拦截: (bash block)\n  原因: ${safety.reason}\n  命令: ${line0}`);
-                return { summary: "⚠️ bash 已处理：脚本块被拦截（relaxed）", resultText: results.join("\n\n") };
+                appendToBuffers(`${results[results.length - 1]}\n\n`);
+                await scheduleStateUpdate(true);
+                // 不中断 UI：继续走统一收尾逻辑
+                throw new Error(`脚本块被拦截（relaxed）：${safety.reason}`);
               }
             }
           }
-          const { stdout, stderr } = await execFileAsync("bash", ["-lc", bashCmd], {
-            cwd,
-            timeout: 60000,
-            maxBuffer: 10 * 1024 * 1024
-          });
-          const output = (stdout + (stderr ? `\n[stderr] ${stderr}` : "")).trim();
-          results.push(`✓ (bash block)\n${output || "(no output)"}`);
+          appendToBuffers(`$ (bash block)\n`);
+          const r = await runBashStreaming(bashCmd);
+          results.push(r.ok ? `✓ (bash block)` : `✗ (bash block)\n  错误: ${r.error || "exit non-zero"}`);
+          appendToBuffers(`\n[exit] ${r.exitCode ?? "?"}\n\n`);
+          await scheduleStateUpdate(true);
         } catch (e) {
           allSuccess = false;
           const errorMsg = e instanceof Error ? e.message : String(e);
           results.push(`✗ (bash block)\n  错误: ${errorMsg}`);
+          appendToBuffers(`\n✗ (bash block)\n  错误: ${errorMsg}\n\n`);
+          await scheduleStateUpdate(true);
         }
       }
     } else {
@@ -1471,31 +2029,41 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
           allSuccess = false;
           const line = `⛔ 已拦截: ${cmd}\n  原因: ${safety.reason}`;
           results.push(line);
+          appendToBuffers(`${line}\n\n`);
+          await scheduleStateUpdate(true);
           this.debug("warn", "autoExecuteBash: blocked", { cmd, reason: safety.reason });
           continue;
         }
         
         try {
-          const { stdout, stderr } = await execAsync(cmd, { 
-            cwd,
-            timeout: 60000,  // 60 秒超时
-            maxBuffer: 10 * 1024 * 1024  // 10MB 缓冲区
-          });
-          
-          const output = (stdout + (stderr ? `\n[stderr] ${stderr}` : "")).trim();
-          results.push(`✓ ${cmd}${output ? `\n${output}` : ""}`);
-          this.debug("info", "autoExecuteBash: command succeeded", { cmd, outputLen: output.length });
+          appendToBuffers(`$ ${cmd}\n`);
+          const r = await runBashStreaming(cmd);
+          if (r.ok) {
+            results.push(`✓ ${cmd}`);
+            this.debug("info", "autoExecuteBash: command succeeded", { cmd });
+          } else {
+            allSuccess = false;
+            results.push(`✗ ${cmd}\n  错误: ${r.error || "exit non-zero"}`);
+            this.debug("error", "autoExecuteBash: command failed", { cmd, error: r.error || "exit non-zero" });
+          }
+          appendToBuffers(`\n[exit] ${r.exitCode ?? "?"}\n\n`);
+          await scheduleStateUpdate(true);
         } catch (e) {
           allSuccess = false;
           const errorMsg = e instanceof Error ? e.message : String(e);
           results.push(`✗ ${cmd}\n  错误: ${errorMsg}`);
           this.debug("error", "autoExecuteBash: command failed", { cmd, error: errorMsg });
+          appendToBuffers(`\n✗ ${cmd}\n  错误: ${errorMsg}\n\n`);
+          await scheduleStateUpdate(true);
         }
       }
     }
     
     // 显示执行结果
-    const resultText = results.join("\n\n");
+    const resultTextFull = fullText || results.join("\n\n");
+    this.output.appendLine("");
+    this.output.appendLine(`[${new Date().toISOString()}] [bash] stream end (${threadId})`);
+    const resultText = this.truncateForState(resultTextFull, "bash 执行结果");
     const summary =
       blocked > 0
         ? `⚠️ bash 已处理：${commands.length} 条（${blocked} 条被拦截）`
@@ -1506,15 +2074,18 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
     // 不要 toast 弹条：只在对话框里输出 system
     
     // 结果对用户可见：同时写入聊天消息 + 上下文（便于后续生成 diff）
-    await this.store.addMessage(threadId, "system", ["[bash 执行结果]", "", resultText].join("\n"));
+    await this.store.updateMessageText(threadId, bashMsgId, ["[bash 执行结果]", "", resultText].join("\n"));
     await this.store.addSnippet(threadId, "bash 执行结果", resultText);
     await this.pushState();
     
     this.debug("info", "autoExecuteBash: completed", { success: allSuccess });
 
     // 像 Claude Code：把 bash 的输出回传给模型，让它基于结果继续下一步（diff/toolcall/bash）
-    if (opts?.continueAfter ?? true) {
+    if ((opts?.continueAfter ?? true) && !bashAbort.signal.aborted) {
       await this.continueAfterBashAuto(threadId);
+    }
+    if (this.activeBash?.threadId === threadId && this.activeBash?.messageId === bashMsgId) {
+      this.activeBash = undefined;
     }
     return { summary, resultText };
   }
@@ -1526,23 +2097,23 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
       this.debug("warn", "continueAfterBashAuto: skip because busy(other thread)", { activeThreadId: this.active?.threadId });
       return;
     }
-    const t = await this.store.getThread(threadId);
-    const lastUser = t?.messages?.slice().reverse().find((m) => m.role === "user")?.text ?? "";
+    const lastUser = await this.getLastUserIntent(threadId);
     const extra = [
       "---",
       "# 工具结果已产生",
       "我已执行了你输出的 bash 命令，执行结果已追加到上下文片段（标题：bash 执行结果），并在聊天记录里以 system 消息记录。",
-      "现在请基于用户需求 + 工具结果继续下一步：",
+      "现在请继续推进（不要复述用户需求）：",
       "",
       "【选择规则】",
       "- 需要改代码：输出 diff --git 开头的 unified diff",
       "- 还需要再查/再跑：输出 ```toolcall``` 或 ```bash```（会自动继续执行并回传结果）",
+      "- 若你确认已完成：输出“最终回答”（不要任何代码块）",
       "",
       "【重要】严格遵守格式要求，不要输出解释文字。"
     ].join("\n");
     const tooling = await this.buildToolingPromptForThread(
       threadId,
-      lastUser || "（继续基于最新工具结果完成用户需求）",
+      this.buildNeutralContinueUserText(),
       "patch",
       extra
     );
@@ -1588,7 +2159,13 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
    */
   private async retryDiffGeneration(threadId: string, errorMsg: string, retryCount: number, userText?: string) {
     const t = await this.store.getThread(threadId);
-    const lastUser = userText ?? t?.messages?.slice().reverse().find((m) => m.role === "user")?.text ?? "";
+    const lastRaw = userText ?? t?.messages?.slice().reverse().find((m) => m.role === "user")?.text ?? "";
+    const lastUser = this.extractUserIntent(lastRaw);
+    if (lastUser) {
+      this.lastUserIntent[threadId] = lastUser;
+      this.lastUserIntentSig[threadId] = this.hashTextShort(lastUser);
+      this.lastUserIntentTs[threadId] = Date.now();
+    }
     const extra = [
       "---",
       "# 重要：上一次的 diff 补丁应用失败",
@@ -1647,7 +2224,7 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
   /**
    * 自动应用 diff 补丁（不需要用户确认）
    */
-  private async autoApplyDiff(threadId: string, diffText: string) {
+  private async autoApplyDiff(threadId: string, diffText: string, opts?: { continueAfter?: boolean }) {
     if (this.readOnlyMode) {
       await this.notifyInChat(threadId, "🔒 只读模式：已拦截自动应用 diff。你可以点击消息里的「预览并应用补丁」手动确认。");
       return;
@@ -1687,7 +2264,10 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
     await this.store.addSnippet(threadId, "diff 应用结果", resultText);
     await this.pushState();
 
+    // 根据用户要求：diff 成功也继续自动链，直到模型输出“最终回答”或用户点击停止。
+    if (opts?.continueAfter ?? true) {
     await this.continueAfterDiffAuto(threadId);
+    }
   }
 
   private async continueAfterDiffAuto(threadId: string) {
@@ -1697,23 +2277,22 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
       this.debug("warn", "continueAfterDiffAuto: skip because busy(other thread)", { activeThreadId: this.active?.threadId });
       return;
     }
-    const t = await this.store.getThread(threadId);
-    const lastUser = t?.messages?.slice().reverse().find((m) => m.role === "user")?.text ?? "";
+    const lastUser = await this.getLastUserIntent(threadId);
     const extra = [
       "---",
       "# 补丁已应用",
       "我已自动应用你输出的 unified diff，应用结果已追加到上下文片段（标题：diff 应用结果），并在聊天记录里以 system 消息记录。",
-      "现在请基于用户需求 + 应用结果继续下一步：",
+      "现在请继续推进（不要复述用户需求）：",
       "",
       "【选择规则】",
       "- 若仍有失败项：优先输出一个新的 diff 修复失败（或必要时输出 toolcall/bash 进一步确认状态）",
-      "- 若已完成：不要输出任何内容会导致执行；可输出一个最小 diff（空 diff 不允许）时请改用 toolcall 先确认",
+      "- 若你确认已完成：输出“最终回答”（不要任何代码块）",
       "",
       "【重要】严格遵守格式要求，不要输出解释文字。"
     ].join("\n");
     const tooling = await this.buildToolingPromptForThread(
       threadId,
-      lastUser || "（继续基于最新工具结果完成用户需求）",
+      this.buildNeutralContinueUserText(),
       "patch",
       extra
     );
@@ -1777,12 +2356,15 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
     await this.store.addSnippet(
       threadId,
       `工具结果: ${result.title}`,
+      this.truncateForState(
       [
         `tool: ${result.tool}`,
         `ok: ${result.ok}`,
         "",
         result.content
-      ].join("\n")
+        ].join("\n"),
+        `工具结果: ${result.title}`
+      )
     );
     await this.pushState();
 
@@ -1794,18 +2376,18 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
     }
 
     // 自动继续：让模型基于"工具结果"决定下一步
-    const t = await this.store.getThread(threadId);
-    const lastUser = t?.messages?.slice().reverse().find((m) => m.role === "user")?.text ?? "";
+    const lastUser = await this.getLastUserIntent(threadId);
     const extra = [
       "---",
       "# 强制指令",
       "我已执行了你的 toolcall 并返回了结果（见上下文片段）。",
-      "现在根据用户需求选择合适的格式输出：",
+      "现在请继续推进（不要复述用户需求）：",
       "",
       "【选择规则】",
       "- 如果需要修改文件内容：输出 diff --git 开头的 unified diff",
       "- 如果需要执行命令（如删除文件、创建目录、安装依赖）：输出 ```bash``` 代码块",
       "- 如果还需要更多信息：输出 ```toolcall``` 代码块",
+      "- 若你确认已完成：输出“最终回答”（不要任何代码块）",
       "",
       "【格式要求】",
       "- diff：第一个字符必须是 d（diff --git 开头）",
@@ -1814,7 +2396,7 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
       "",
       "立刻输出！"
     ].join("\n");
-    const tooling = await this.buildToolingPromptForThread(threadId, lastUser || "（继续基于最新工具结果完成用户需求）", "patch", extra);
+    const tooling = await this.buildToolingPromptForThread(threadId, this.buildNeutralContinueUserText(), "patch", extra);
     const prompt = tooling.prompt;
 
     const assistantId = `assistant_${Date.now()}_${Math.random().toString(16).slice(2)}`;
@@ -1852,6 +2434,99 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  private async runToolCallBatchAndContinueAuto(threadId: string, calls: ToolCall[]) {
+    this.debug("info", "runToolCallBatchAndContinueAuto: start", { threadId, count: calls.length });
+
+    // 依次执行多个 toolcall；只在最后继续一次，避免中间多轮“继续”打断/重入。
+    for (const call of calls) {
+      this.debug("info", "runToolCallBatchAndContinueAuto: running", { tool: call.tool });
+      let result: { tool: string; ok: boolean; title: string; content: string };
+      try {
+        result = await runToolCall(call);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        result = { tool: call.tool, ok: false, title: `${call.tool}: (failed)`, content: msg };
+        this.debug("error", "runToolCallBatchAndContinueAuto: tool failed", { tool: call.tool, error: msg });
+      }
+      await this.store.addSnippet(
+        threadId,
+        `工具结果: ${result.title}`,
+        this.truncateForState(
+          [
+            `tool: ${result.tool}`,
+            `ok: ${result.ok}`,
+            "",
+            result.content
+          ].join("\n"),
+          `工具结果: ${result.title}`
+        )
+      );
+      await this.pushState();
+    }
+
+    if (!(await this.tryConsumeAutoChain(threadId, "toolcall->continue"))) return;
+    if (this.isBusyOtherThread(threadId)) {
+      this.debug("warn", "runToolCallBatchAndContinueAuto: skip because busy(other thread)", { activeThreadId: this.active?.threadId });
+      return;
+    }
+
+    const lastUser = await this.getLastUserIntent(threadId);
+    const extra = [
+      "---",
+      "# 强制指令",
+      "我已执行了你输出的多条 toolcall 并返回了结果（见上下文片段）。",
+      "现在请继续推进（不要复述用户需求）：",
+      "",
+      "【选择规则】",
+      "- 如果需要修改文件内容：输出 diff --git 开头的 unified diff",
+      "- 如果需要执行命令（如删除文件、创建目录、安装依赖）：输出 ```bash``` 代码块",
+      "- 如果还需要更多信息：输出 ```toolcall``` 代码块",
+      "- 若你确认已完成：输出“最终回答”（不要任何代码块）",
+      "",
+      "【格式要求】",
+      "- diff：第一个字符必须是 d（diff --git 开头）",
+      "- bash：必须是 ```bash\\n命令\\n``` 格式",
+      "- 绝对禁止输出任何解释、前言、后语",
+      "",
+      "立刻输出！"
+    ].join("\n");
+    const tooling = await this.buildToolingPromptForThread(threadId, this.buildNeutralContinueUserText(), "patch", extra);
+    const prompt = tooling.prompt;
+
+    const assistantId = `assistant_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    await this.store.addMessage(threadId, "assistant", "", assistantId);
+    await this.pushState();
+
+    const abort = new AbortController();
+    this.active = { threadId, messageId: assistantId, abort, lastText: "" };
+
+    try {
+      const r = await this.deepseek.sendStreamingWithDebug(
+        prompt,
+        async (u) => {
+          if (!this.active || this.active.threadId !== threadId || this.active.messageId !== assistantId) return;
+          this.active.lastText = u.text;
+          this._post({ type: "assistantStream", threadId, messageId: assistantId, text: u.text, done: u.done });
+        },
+        { signal: abort.signal, debug: (e) => this.debug(e.level, `runToolCallBatchAndContinueAuto: ${e.msg}`, e.data) }
+      );
+      await this.store.updateMessageText(threadId, assistantId, r.assistantText);
+      await this.store.updateWebContext(threadId, tooling.after);
+      await this.pushState();
+      this.debug("info", "runToolCallBatchAndContinueAuto: done", { assistantChars: r.assistantText.length });
+
+      await this.autoProcessReply(threadId, r.assistantText, 0, lastUser);
+    } catch (e) {
+      const last = this.active?.lastText || "";
+      const msgText = `${last}${last ? "\n\n" : ""}[已取消/失败：${e instanceof Error ? e.message : String(e)}]`;
+      await this.store.updateMessageText(threadId, assistantId, msgText);
+      await this.pushState();
+      this.debug("error", "runToolCallBatchAndContinueAuto: failed", { error: e instanceof Error ? e.message : String(e) });
+    } finally {
+      if (this.active?.threadId === threadId && this.active?.messageId === assistantId) this.active = undefined;
+    }
+  }
+
   private async runToolPlanAndGeneratePatch(threadId: string, planText: string) {
     // 解析 toolplan JSON
     let plan: any;
@@ -1861,14 +2536,15 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
       this.debug("error", "toolPlanRun: invalid JSON");
       throw new Error("toolplan 不是合法 JSON。");
     }
+    const norm = this.normalizeToolPlanJson(plan);
     // 死循环判定：连续重复同一个 toolplan（read 列表 + notes）才停
     try {
-      const sig = `toolplan:${this.stableStringify({ read: plan?.read ?? [], notes: plan?.notes ?? "" })}`;
+      const sig = `toolplan:${this.stableStringify({ read: norm.read ?? [], notes: norm.notes ?? "" })}`;
       if (await this.stopIfRepeated(threadId, sig, "toolplan(repeated)")) return;
     } catch {
       // ignore repeat detection parse errors
     }
-    const readList = Array.isArray(plan?.read) ? plan.read : [];
+    const readList = Array.isArray(norm?.read) ? norm.read : [];
     const invalidReads: string[] = [];
     const relPaths = readList
       .map((x: unknown) => {
@@ -1895,25 +2571,27 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
 
     for (const rp of relPaths) {
       this.debug("info", "toolPlanRun: reading file", { path: rp });
-      const content = await this.readWorkspaceRelFile(rp);
+      const contentFull = await this.readWorkspaceRelFile(rp);
+      this.writeLargeToOutput(`工具读取(full): ${rp}`, contentFull);
+      const content = this.truncateForState(contentFull, `工具读取: ${rp}`);
       await this.store.addSnippet(threadId, `工具读取: ${rp}`, content);
     }
     await this.pushState();
 
     if (!(await this.tryConsumeAutoChain(threadId, "toolplan->continue"))) return;
 
-    const t = await this.store.getThread(threadId);
-    const lastUser = t?.messages?.slice().reverse().find((m) => m.role === "user")?.text ?? "";
+    const lastUser = await this.getLastUserIntent(threadId);
     const extra = [
       "---",
       "# 强制指令",
       "我已按你的 toolplan 读取了文件（见上下文片段）。",
-      "现在根据用户需求选择合适的格式输出：",
+      "现在请继续推进（不要复述用户需求）：",
       "",
       "【选择规则】",
       "- 如果需要修改文件内容：输出 diff --git 开头的 unified diff",
       "- 如果需要执行命令（如删除文件、创建目录、安装依赖）：输出 ```bash``` 代码块",
       "- 如果还需要更多信息：输出 ```toolcall``` 代码块",
+      "- 若你确认已完成：输出“最终回答”（不要任何代码块）",
       "",
       "【格式要求】",
       "- diff：第一个字符必须是 d（diff --git 开头）",
@@ -1922,7 +2600,7 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
       "",
       "立刻输出！"
     ].join("\n");
-    const tooling = await this.buildToolingPromptForThread(threadId, lastUser || "（继续基于最新工具结果完成用户需求）", "patch", extra);
+    const tooling = await this.buildToolingPromptForThread(threadId, this.buildNeutralContinueUserText(), "patch", extra);
     const prompt = tooling.prompt;
 
     const assistantId = `assistant_${Date.now()}_${Math.random().toString(16).slice(2)}`;
@@ -1959,6 +2637,68 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
       this.debug("error", "toolPlanRun: generate diff failed", { error: e instanceof Error ? e.message : String(e) });
       await this.store.updateMessageText(threadId, assistantId, msgText);
       await this.pushState();
+    } finally {
+      if (this.active?.threadId === threadId && this.active?.messageId === assistantId) this.active = undefined;
+    }
+  }
+
+  private async requestStrictReformat(threadId: string, badReply: string, reason: string) {
+    // 不要把旧“用户需求”再塞回去（避免 DeepSeek 重新分析已解决问题）；
+    // 这里只做“格式纠正”，让模型把上一条输出改成合规的单块输出。
+    const extra = [
+      "---",
+      "# 格式纠正（只修格式，不要重新分析需求）",
+      `原因：${reason}`,
+      "",
+      "你现在必须把上一条回复改写成合规输出：",
+      "- 只允许输出：toolplan 或 diff 或 toolcall 或 bash 或 最终回答（五选一）",
+      "- 当你选择输出 toolplan/toolcall/diff/bash：整条回复必须且只能包含一个对应的 markdown 代码块；代码块外一个字都不许有",
+      "- diff：必须放进 ```diff``` 且以 diff --git 开头；并且一个 diff 里只允许一个文件（只允许一段 diff --git）",
+      "- toolplan：必须是 {\"read\":[\"a\",\"b\"],\"notes\":\"\"}；禁止旧数组格式",
+      "",
+      "# 参考（这是需要你改写的原始内容，勿复述）",
+      badReply.slice(0, 6000),
+      "",
+      "立刻输出合规内容："
+    ].join("\n");
+
+    const tooling = await this.buildToolingPromptForThread(threadId, "（格式纠正：只需按规则重排输出）", "patch", extra);
+    const prompt = tooling.prompt;
+
+    const assistantId = `assistant_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    await this.store.addMessage(threadId, "assistant", "", assistantId);
+    await this.pushState();
+
+    // 若“其他线程”正在忙，不要打断它；本线程内允许继续纠错
+    if (this.isBusyOtherThread(threadId)) {
+      this.debug("warn", "requestStrictReformat: skip because busy(other thread)", { activeThreadId: this.active?.threadId });
+      return;
+    }
+    const abort = new AbortController();
+    this.active = { threadId, messageId: assistantId, abort, lastText: "" };
+
+    try {
+      const r = await this.deepseek.sendStreamingWithDebug(
+        prompt,
+        async (u) => {
+          if (!this.active || this.active.threadId !== threadId || this.active.messageId !== assistantId) return;
+          this.active.lastText = u.text;
+          this._post({ type: "assistantStream", threadId, messageId: assistantId, text: u.text, done: u.done });
+        },
+        { signal: abort.signal, debug: (e) => this.debug(e.level, `formatFix: ${e.msg}`, e.data), deepThink: this.deepThinkMode }
+      );
+      await this.store.updateMessageText(threadId, assistantId, r.assistantText);
+      await this.store.updateWebContext(threadId, tooling.after);
+      await this.pushState();
+      this.debug("info", "requestStrictReformat: done", { assistantChars: r.assistantText.length });
+
+      await this.autoProcessReply(threadId, r.assistantText, 0, "（格式纠正：不再重复旧需求）");
+    } catch (e) {
+      const last = this.active?.lastText || "";
+      const msgText = `${last}${last ? "\n\n" : ""}[格式纠正失败：${e instanceof Error ? e.message : String(e)}]`;
+      await this.store.updateMessageText(threadId, assistantId, msgText);
+      await this.pushState();
+      this.debug("error", "requestStrictReformat: failed", { error: e instanceof Error ? e.message : String(e) });
     } finally {
       if (this.active?.threadId === threadId && this.active?.messageId === assistantId) this.active = undefined;
     }
@@ -2007,12 +2747,15 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
     await this.store.addSnippet(
       threadId,
       `工具结果: ${result.title}`,
+      this.truncateForState(
       [
         `tool: ${result.tool}`,
         `ok: ${result.ok}`,
         "",
         result.content
-      ].join("\n")
+        ].join("\n"),
+        `工具结果: ${result.title}`
+      )
     );
     await this.pushState();
 

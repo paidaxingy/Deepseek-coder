@@ -288,20 +288,62 @@ export class DeepSeekPlaywright {
     await this.ensureDeepThinkEnabled(page, debug, deepThink);
     
     // 1. 找到输入框并填充内容
-    const input = page.locator("textarea").first();
+    // DeepSeek 页面可能存在多个 textarea（隐藏的/历史残留的）。优先选“最后一个可见”的。
+    const allInputs = page.locator("textarea");
+    await allInputs.first().waitFor({ state: "attached", timeout: 15000 });
+    const nInputs = await allInputs.count().catch(() => 0);
+    let input = allInputs.first();
+    for (let i = Math.max(0, nInputs - 1); i >= 0; i--) {
+      const cand = allInputs.nth(i);
+      const vis = await cand.isVisible().catch(() => false);
+      if (vis) {
+        input = cand;
+        break;
+      }
+    }
     await input.waitFor({ state: "visible", timeout: 15000 });
     await input.click();
     
+    const fillPromptSafely = async () => {
     // 清空现有内容
-    await input.fill("");
-    await this.safeWait(page, 100);
+      await input.fill("").catch(() => {});
+      await this.safeWait(page, 120);
     
     // 填充新内容
-    await input.fill(prompt);
-    debug?.({ level: "info", msg: "prompt filled", data: { promptChars: prompt.length } });
-    
-    // 等待一下让 UI 更新
-    await this.safeWait(page, 500);
+      await input.fill(prompt).catch(() => {});
+      await this.safeWait(page, 120);
+
+      // 校验：有时网页会吞掉部分输入（尤其是很长 prompt/DOM 重绘）
+      const actual = await input.inputValue().catch(() => "");
+      if (actual.length < Math.min(20, prompt.length)) {
+        // 兜底：直接通过 DOM 赋值 + 触发 input 事件
+        await page
+          .evaluate(
+            ({ v }) => {
+              const tas = Array.from(document.querySelectorAll("textarea")).filter((t) => {
+                const ta = t as HTMLTextAreaElement;
+                const r = ta.getBoundingClientRect();
+                const s = window.getComputedStyle(ta as any);
+                return r.width > 10 && r.height > 10 && s.display !== "none" && s.visibility !== "hidden";
+              });
+              const ta = (tas[tas.length - 1] as HTMLTextAreaElement) || (document.querySelector("textarea") as HTMLTextAreaElement | null);
+              if (!ta) return;
+              ta.focus();
+              ta.value = v;
+              ta.dispatchEvent(new Event("input", { bubbles: true }));
+              ta.dispatchEvent(new Event("change", { bubbles: true }));
+            },
+            { v: prompt }
+          )
+          .catch(() => {});
+      }
+      debug?.({ level: "info", msg: "prompt filled", data: { promptChars: prompt.length, textareaCount: nInputs } });
+
+      // 等待一下让 UI 更新（发送按钮启用/布局稳定）
+      await this.safeWait(page, 450);
+    };
+
+    await fillPromptSafely();
     
     const isGeneratingNow = async (): Promise<boolean> => {
       // 尽量与 waitForDeepSeekReady 的“stop icon”判定保持一致
@@ -329,15 +371,28 @@ export class DeepSeekPlaywright {
       return c > baseCount;
     };
 
-    const confirmSent = async (): Promise<boolean> => {
-      // 多信号确认：避免仅靠 textarea 清空导致误判
-      if (await isGeneratingNow()) return true;
-      if (await isMessageCountIncreased()) return true;
-      const remaining = await input.inputValue().catch(() => prompt);
-      if (remaining.length < prompt.length * 0.3) return true;
+    const waitForSentSignal = async (ms = 3500): Promise<boolean> => {
+      // 多信号确认：生成中 / 消息数增加 / 输入框明显变短
+      const start = Date.now();
+      while (Date.now() - start < ms) {
+        if (await isGeneratingNow()) {
+          debug?.({ level: "info", msg: "send confirmed (generating icon)" });
+          return true;
+        }
+        if (await isMessageCountIncreased()) {
+          debug?.({ level: "info", msg: "send confirmed (message count increased)" });
+          return true;
+        }
+        const remaining = await input.inputValue().catch(() => prompt);
+        if (remaining.length < prompt.length * 0.3) {
+          debug?.({ level: "info", msg: "send confirmed (input cleared/shrunk)", data: { remaining: remaining.length } });
+          return true;
+        }
+        await this.safeWait(page, 250);
+      }
       return false;
     };
-
+    
     // 2. 找到并点击发送按钮（DeepSeek 的发送按钮）
     // 通过诊断确认：发送按钮 class 包含 _7436101 和 ds-icon-button
     const sendButtonSelectors = [
@@ -354,28 +409,86 @@ export class DeepSeekPlaywright {
     
     let sent = false;
     
-    // 尝试各种发送按钮选择器
+    const clickSendNearTextareaViaJS = async (): Promise<boolean> => {
+      const ok = await page
+        .evaluate(() => {
+          const visible = (el: Element) => {
+            const h = el as HTMLElement;
+            const r = h.getBoundingClientRect();
+            const s = window.getComputedStyle(h as any);
+            return r.width > 10 && r.height > 10 && s.display !== "none" && s.visibility !== "hidden";
+          };
+          const tas = Array.from(document.querySelectorAll("textarea")).filter(visible) as HTMLTextAreaElement[];
+          const ta = tas[tas.length - 1];
+          if (!ta) return false;
+          const tar = ta.getBoundingClientRect();
+          const scope =
+            (ta.closest("form") as HTMLElement | null) ||
+            (ta.closest("div") as HTMLElement | null) ||
+            (ta.parentElement as HTMLElement | null);
+          if (!scope) return false;
+
+          const candidates = Array.from(
+            scope.querySelectorAll("button, div[role='button'], [class*='ds-icon-button'], [class*='_7436101']")
+          ).filter(visible) as HTMLElement[];
+
+          // 选一个“在 textarea 右侧附近”的可点击元素
+          candidates.sort((a, b) => {
+            const ra = a.getBoundingClientRect();
+            const rb = b.getBoundingClientRect();
+            return ra.left - rb.left;
+          });
+
+          let best: HTMLElement | null = null;
+          let bestScore = -1;
+          for (const el of candidates) {
+            const r = el.getBoundingClientRect();
+            const isRight = r.left >= tar.right - 10;
+            const isNearY = Math.abs(r.top - tar.top) < 120 || Math.abs(r.bottom - tar.bottom) < 120;
+            const inLowerHalf = r.top > window.innerHeight * 0.45;
+            const ariaDisabled = (el.getAttribute("aria-disabled") || "").toLowerCase() === "true";
+            if (ariaDisabled) continue;
+            if (!inLowerHalf) continue;
+            const score = (isRight ? 2 : 0) + (isNearY ? 1 : 0) + Math.min(2, r.width / 40);
+            if (score > bestScore) {
+              bestScore = score;
+              best = el;
+            }
+          }
+          if (!best) return false;
+          best.click();
+          return true;
+        })
+        .catch(() => false);
+      if (ok) debug?.({ level: "info", msg: "clicked send via JS (near textarea)" });
+      return ok;
+    };
+
+    const clickSendBySelectors = async (): Promise<boolean> => {
     for (const selector of sendButtonSelectors) {
       try {
         const btn = page.locator(selector).last();
         const count = await btn.count().catch(() => 0);
-        if (count > 0) {
+          if (count <= 0) continue;
           const isVisible = await btn.isVisible().catch(() => false);
-          if (isVisible) {
-            await btn.click({ force: true });
+          if (!isVisible) continue;
+          await btn.click({ force: true, timeout: 3000 }).catch(() => {});
             debug?.({ level: "info", msg: "clicked send button", data: { selector } });
-            await this.safeWait(page, 800);
-            
-            // 检查是否发送成功（多信号确认：生成中 / 消息增量 / 输入框明显变短）
-            if (await confirmSent()) {
-              sent = true;
-              debug?.({ level: "info", msg: "send confirmed (input cleared)" });
-              break;
-            }
-          }
+          return true;
+        } catch {
+          // try next
         }
-      } catch {
-        // 继续尝试下一个选择器
+      }
+      return false;
+    };
+
+    // 先 JS 定位“输入框右侧按钮”，再退化到固定 selector
+    if (await clickSendNearTextareaViaJS()) {
+      sent = await waitForSentSignal(4500);
+    }
+    if (!sent) {
+      if (await clickSendBySelectors()) {
+        sent = await waitForSentSignal(4500);
       }
     }
     
@@ -385,20 +498,16 @@ export class DeepSeekPlaywright {
       
       // 尝试 Enter
       await input.click();
-      await input.press("Enter");
-      await this.safeWait(page, 500);
-
-      if (await confirmSent()) {
+      await input.press("Enter").catch(() => {});
+      if (await waitForSentSignal(4500)) {
         sent = true;
         debug?.({ level: "info", msg: "sent via Enter key" });
       }
       
       if (!sent) {
         // 尝试 Ctrl+Enter
-        await input.press("Control+Enter");
-        await this.safeWait(page, 500);
-
-        if (await confirmSent()) {
+        await input.press("Control+Enter").catch(() => {});
+        if (await waitForSentSignal(4500)) {
           sent = true;
           debug?.({ level: "info", msg: "sent via Ctrl+Enter" });
         }
@@ -406,10 +515,8 @@ export class DeepSeekPlaywright {
       
       if (!sent) {
         // 尝试 Meta+Enter (Mac)
-        await input.press("Meta+Enter");
-        await this.safeWait(page, 500);
-
-        if (await confirmSent()) {
+        await input.press("Meta+Enter").catch(() => {});
+        if (await waitForSentSignal(4500)) {
           sent = true;
           debug?.({ level: "info", msg: "sent via Meta+Enter" });
         }
@@ -443,8 +550,7 @@ export class DeepSeekPlaywright {
         }
       });
       
-      await this.safeWait(page, 800);
-      if (await confirmSent()) {
+      if (await waitForSentSignal(4500)) {
         sent = true;
         debug?.({ level: "info", msg: "sent via JS click" });
       }
@@ -452,6 +558,9 @@ export class DeepSeekPlaywright {
     
     if (!sent) {
       debug?.({ level: "error", msg: "failed to send prompt - all methods exhausted" });
+      // 额外诊断：看看 textarea 是否仍保留大量文本，帮助定位“没发出”还是“发出了但没检测到”
+      const remaining = await input.inputValue().catch(() => "");
+      debug?.({ level: "error", msg: "send failed diag", data: { remainingChars: remaining.length, baseCount } });
       throw new Error("无法发送消息到 DeepSeek。请尝试在浏览器中手动发送。");
     }
   }
@@ -897,22 +1006,55 @@ export class DeepSeekPlaywright {
     }
     
     // 2. 获取最后一条消息（AI 回复）并等待内容稳定
+    // 注意：DeepSeek 页面可能会有虚拟列表/折叠渲染，innerText 有时会丢失或反复波动；
+    // 这里优先用 textContent（更完整、更稳定），并在超时后降级返回“已抓到的最佳内容”，避免把正常输出误判为失败。
     const lastMessage = messageLocator.last();
     let lastText = "";
     let stableCount = 0;
     let actionableSeen = false;
     const start2 = Date.now();
+    let lastChangeAt = Date.now();
     
     debug?.({ level: "info", msg: "waiting for message content to stabilize" });
     
-    while (Date.now() - start2 < 90000) {
+    const isReadingPlaceholderOnly = (raw: string): boolean => {
+      const s0 = String(raw || "").trim();
+      if (!s0) return false;
+
+      // 兼容：Reading\nReading / Reading Reading / ReadingReading（无空格/无换行粘连）
+      const compact = s0.replace(/\s+/g, "").replace(/\r?\n/g, "");
+      if (/^(Reading)+$/i.test(compact) && compact.length <= 80) return true;
+
+      // 清理后为空，但原文像 Reading，则也视为占位噪音
+      const cleaned = this.cleanDeepSeekUIText(s0);
+      if (!cleaned && /Reading/i.test(s0) && s0.length <= 80) return true;
+      return false;
+    };
+
+    // 默认 90s；如果已看到可执行内容（尤其是长 diff），给更宽松的窗口，避免误报超时
+    const maxWaitMs = 150000;
+    while (Date.now() - start2 < maxWaitMs) {
       if (signal?.aborted) throw new Error("已取消");
       
-      const msgText = (await lastMessage.innerText().catch(() => ""))?.trim() ?? "";
+      const msgText =
+        (await lastMessage
+          .evaluate((el) => {
+            const t = ((el as any)?.textContent || "").trim();
+            return t;
+          })
+          .catch(() => ""))?.trim() ?? "";
       
+      // 如果当前只是 DeepSeek 的 loading 占位（Reading），不要当成“内容稳定”，继续等真正内容
+      if (isReadingPlaceholderOnly(msgText)) {
+        stableCount = 0;
+        await this.safeWait(page, 600, signal);
+        continue;
+      }
+
       if (msgText && msgText !== lastText) {
         lastText = msgText;
         stableCount = 0;
+        lastChangeAt = Date.now();
         debug?.({ level: "info", msg: "message content updated", data: { chars: msgText.length, preview: msgText.slice(0, 100) } });
         
         // 1:1 提取：优先从 DOM 拆出 thinking/answer（网页端就是这么分的）
@@ -928,12 +1070,13 @@ export class DeepSeekPlaywright {
         stableCount++;
       }
       
-      // 连续多次相同且非空就认为稳定；如果已经看到过“可执行内容”，只要稳定 1 次就尝试判断是否已结束生成
-      const stableNeed = actionableSeen ? 1 : 3;
+      // 连续多次相同且非空就认为稳定；
+      // 如果已经看到过“可执行内容”，也至少稳定 2 次再判断（避免网页还在 Reading/生成但 stop 图标检测偶发失灵）。
+      const stableNeed = actionableSeen ? 2 : 3;
       if (lastText && stableCount >= stableNeed) {
-        const stillGenerating = await page
+        const gen = await page
           .evaluate(() => {
-            // 输入区附近出现“正方形 rect”通常代表 stop/pause
+            // 输入区附近出现“正方形 rect”通常代表 stop/pause（生成中）
             const svgs = document.querySelectorAll("div[class*='ds-icon-button'] svg");
             for (let i = 0; i < svgs.length; i++) {
               const svg = svgs[i];
@@ -942,27 +1085,47 @@ export class DeepSeekPlaywright {
               const parent = svg.closest("div[class*='ds-icon-button']") as HTMLElement | null;
               if (!parent) continue;
               const r = parent.getBoundingClientRect();
-              if (r.width > 20 && r.top > window.innerHeight * 0.5) return true;
+              if (r.width > 20 && r.top > window.innerHeight * 0.5) return { hasStop: true };
             }
-            return false;
+            return { hasStop: false };
           })
-          .catch(() => false);
+          .catch(() => ({ hasStop: false }));
+        const stillGenerating = Boolean((gen as any)?.hasStop);
 
         if (stillGenerating) {
           debug?.({ level: "info", msg: "message stabilized but still generating; keep waiting" });
         } else {
-          debug?.({ level: "info", msg: "message content finalized", data: { chars: lastText.length, actionableSeen } });
           const finalKey = await this.extractStructuredAssistantTextFromMessage(lastMessage, lastText, debug);
+          // 如果最终提取出来是空（通常意味着拿到的只是 UI 噪音/占位），继续等待，不要提前 done
+          if (!finalKey.trim()) {
+            debug?.({ level: "warn", msg: "stabilized but extracted content empty; keep waiting", data: { chars: lastText.length } });
+            stableCount = 0;
+            await this.safeWait(page, 600, signal);
+            continue;
+          }
+          // 兜底：即使 stop 图标没检测到，如果 diff 结构还不完整，也不要提前结束
+          if (actionableSeen && /diff --git /.test(finalKey) && !this.isLikelyCompleteUnifiedDiff(finalKey)) {
+            debug?.({ level: "warn", msg: "stabilized but diff looks incomplete; keep waiting", data: { chars: lastText.length } });
+          } else {
+            debug?.({ level: "info", msg: "message content finalized", data: { chars: lastText.length, actionableSeen } });
           onUpdate({ text: finalKey, done: true });
           return finalKey;
+          }
         }
       }
       
-      await this.safeWait(page, 600, signal);
+      // 如果长时间完全没变化，适当增加轮询间隔，减少对页面的压力
+      const idleMs = Date.now() - lastChangeAt;
+      const sleep = idleMs > 20000 ? 900 : 600;
+      await this.safeWait(page, sleep, signal);
     }
     
-    debug?.({ level: "error", msg: "timeout waiting for message content" });
-    throw new Error("等待 DeepSeek 回复超时（90s）。你可以在浏览器窗口里确认是否已输出。");
+    // 超时：不要直接失败（用户反馈：网页端仍在正常输出/已输出完成）。
+    // 降级：返回目前抓到的最后内容（尽可能提取结构化 answer），并把情况记日志。
+    debug?.({ level: "error", msg: "timeout waiting for message content (degraded)", data: { chars: lastText.length } });
+    const finalKey = await this.extractStructuredAssistantTextFromMessage(lastMessage, lastText || "", debug);
+    onUpdate({ text: finalKey, done: true });
+    return finalKey;
   }
 
   private buildStructuredParts(thinkingHeader: string, thinkingBody: string, answer: string): string {
@@ -1079,7 +1242,11 @@ export class DeepSeekPlaywright {
 
     // 尝试提取裸 JSON（toolcall 格式）：DeepSeek 网页端有时会把 ```toolcall``` 渲染成
     // toolcall\nCopy\nDownload\n{...}（innerText 丢失围栏）。此处用括号深度匹配补回围栏。
-    const toolKeyIdx = Math.max(text.toLowerCase().lastIndexOf("toolcall"), text.search(/"tool"\s*:/));
+    const toolKeyIdx = Math.max(
+      text.toLowerCase().lastIndexOf("toolcall"),
+      text.search(/"tool"\s*:/),
+      text.search(/"(readFile|listDir|searchText)"\s*:/)
+    );
     if (toolKeyIdx !== -1) {
       const json = this.extractFirstJsonObjectFrom(text, toolKeyIdx);
       if (json && this.isValidToolJson("toolcall", json)) {
@@ -1114,6 +1281,13 @@ export class DeepSeekPlaywright {
       const inner = (bashMarker[2] || "").trim();
       if (inner) return ["```bash", inner, "```"].join("\n");
     }
+    // 兜底：有时模型会写成“……。bash\n<cmd>”，bash 不在行首导致上面规则匹配不到
+    // 这里允许 bash 前面是标点/空白（但仍要求后面紧跟换行与命令）
+    const bashMarkerLoose = /(?:^|[^\w])bash\s*\r?\n([\s\S]+)$/i.exec(text);
+    if (bashMarkerLoose) {
+      const inner = (bashMarkerLoose[1] || "").trim();
+      if (inner) return ["```bash", inner, "```"].join("\n");
+    }
     
     // 没有特殊格式，返回原文
     return text;
@@ -1130,6 +1304,27 @@ export class DeepSeekPlaywright {
     // bare diff
     if (s.startsWith("diff --git ")) return true;
     return false;
+  }
+
+  private isLikelyCompleteUnifiedDiff(key: string): boolean {
+    const raw = String(key || "").trim();
+    if (!raw) return false;
+    // 只看 answer 区（如果存在结构化标记）
+    const idx = raw.indexOf("<<<DS_ANSWER>>>");
+    const s0 = idx === -1 ? raw : raw.slice(idx + "<<<DS_ANSWER>>>".length).trim();
+
+    let s = s0;
+    const m = /^```diff\s*([\s\S]*?)```$/m.exec(s0);
+    if (m) s = String(m[1] || "").trim();
+
+    if (!s.startsWith("diff --git ")) return false;
+    // 必要结构：文件头 + hunk（或 new file mode）
+    if (!/\n---\s+/.test(s)) return false;
+    if (!/\n\+\+\+\s+/.test(s)) return false;
+    const hasHunk = /\n@@\s+-\d+/.test(s);
+    const hasNewFile = /\nnew file mode\b/.test(s);
+    if (!hasHunk && !hasNewFile) return false;
+    return true;
   }
 
   /**
@@ -1156,12 +1351,30 @@ export class DeepSeekPlaywright {
       // 单独的 "text" 行（通常是误抓的标签）
       /^text$/gm,
       // DeepSeek 网页端“浏览/检索”系统状态行（不是正文）
-      /^Read\s+\d+\s+web\s+pages\s*$/gim
+      /^Read\s+\d+\s+web\s+pages\s*$/gim,
+      // DeepSeek 网页端常见 loading 状态（会出现 "Reading" / "Reading\nReading"）
+      /^Reading\s*$/gim
     ];
     
     for (const pattern of uiPatterns) {
       text = text.replace(pattern, "\n");
     }
+
+    // 额外兜底：DeepSeek 有时会把 loading 状态粘连成 "ReadingReading"（无换行/无空格）
+    // 统一拆开，后续会被 /^Reading$/ 规则清掉
+    text = text.replace(/ReadingReading/gi, "Reading\nReading");
+
+    // 额外兜底：有时 Copy/Download 会被抓成“无换行粘连”（例如：diffCopyDownloaddiff --git）
+    // 这会导致后续无法识别 diff --git 行首。这里做保守归一化：
+    // - 移除 CopyDownload（含无空格/无换行/带少量空白）
+    // - 修复 diffCopyDownloaddiff --git → diff --git
+    text = text.replace(/Copy\s*Download/gi, "\n");
+    text = text.replace(/CopyDownload/gi, "\n");
+    text = text.replace(/diff\s*Copy\s*Download\s*diff\s*--git/gi, "diff --git");
+    text = text.replace(/diffCopyDownloaddiff\s*--git/gi, "diff --git");
+    // 同理：语言标签 + CopyDownload 粘连
+    text = text.replace(/\b(toolplan|toolcall|diff|bash|sh)\s*Copy\s*Download\b/gi, "$1\n");
+    text = text.replace(/\b(toolplan|toolcall|diff|bash|sh)CopyDownload\b/gi, "$1\n");
     
     // 清理多余的空行
     text = text.replace(/\n{3,}/g, "\n\n");
@@ -1442,6 +1655,7 @@ export class DeepSeekPlaywright {
       /^DeepThink$/i,
       /^AI-generated$/i,
       /^Search$/i,
+      /^Reading$/i,
       /^for reference only$/i,
       /^This response is AI-generated$/i,
       /^复制$/,
@@ -1480,6 +1694,8 @@ export class DeepSeekPlaywright {
     const lines = cleanedText.split("\n");
     const result: string[] = [];
     let inHunk = false;
+    let sawDiffHeader = false;
+    let sawAnyChangeLine = false;
     let nonCodeLineCount = 0;
 
     // 页面尾部的 UI 文字：必须尽量“保守判定”，避免误伤真实代码行（例如 searching = True）
@@ -1489,6 +1705,7 @@ export class DeepSeekPlaywright {
       if (/^DeepThink$/i.test(s)) return true;
       if (/^AI-generated$/i.test(s)) return true;
       if (/^Search$/i.test(s)) return true;
+      if (/^Reading$/i.test(s)) return true;
       if (/^for reference only$/i.test(s)) return true;
       if (/^This response is AI-generated$/i.test(s)) return true;
       if (s === "复制" || s === "重新生成" || s === "编辑") return true;
@@ -1560,6 +1777,16 @@ export class DeepSeekPlaywright {
         line.startsWith("\\") || // "\ No newline at end of file"
         trimmed === "";
 
+      if (isDiffMeta) {
+        sawDiffHeader = true;
+      }
+      if (!sawAnyChangeLine && (line.startsWith("+") || line.startsWith("-"))) {
+        sawAnyChangeLine = true;
+        // DeepSeek 有时会丢失 @@ hunk header，但已经出现 +/- 行时，后续很可能仍是 hunk 内容
+        // 为避免在遇到“无前缀代码行”（如 @app.route/def/class）时提前截断，这里提前进入“宽容模式”
+        inHunk = inHunk || sawDiffHeader;
+      }
+
       if (isDiffMeta || isDiffContent) {
         result.push(line);
         nonCodeLineCount = 0;
@@ -1569,10 +1796,21 @@ export class DeepSeekPlaywright {
         result.push(line);
         nonCodeLineCount = 0;
       } else {
-        // 不在 hunk 内，不是 diff 元信息，跳过
-        nonCodeLineCount++;
-        if (nonCodeLineCount >= 2) {
-          break;
+        // 不在 hunk 内，不是 diff 元信息：
+        // 兜底：如果已经见过 +/- 变更行，且当前行看起来像代码（例如 @decorator/def/import 等），也当作 hunk 内容保留，
+        // 避免“到某一行突然被截断”的问题。
+        const looksLikeCode =
+          sawAnyChangeLine &&
+          (/^[@A-Za-z_]/.test(trimmed) || /^def\s+/.test(trimmed) || /^class\s+/.test(trimmed) || /^import\s+/.test(trimmed));
+        if (looksLikeCode) {
+          inHunk = true;
+          result.push(line);
+          nonCodeLineCount = 0;
+        } else {
+          nonCodeLineCount++;
+          if (nonCodeLineCount >= 2) {
+            break;
+          }
         }
       }
     }
@@ -1596,8 +1834,16 @@ export class DeepSeekPlaywright {
         return Array.isArray(obj?.read);
       }
       if (kind === "toolcall") {
-        // toolcall 必须有 tool 字段
-        return typeof obj?.tool === "string" && obj.tool.length > 0;
+        // toolcall 标准：必须有 tool 字段
+        if (typeof obj?.tool === "string" && obj.tool.length > 0) return true;
+        // toolcall 变体/批量：顶层 key=工具名
+        if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+          const allowed = new Set(["listDir", "readFile", "searchText"]);
+          const keys = Object.keys(obj);
+          const usable = keys.filter((k) => allowed.has(k) && obj[k] && typeof obj[k] === "object" && !Array.isArray(obj[k]));
+          if (usable.length > 0) return true;
+        }
+        return false;
       }
       return false;
     } catch {
