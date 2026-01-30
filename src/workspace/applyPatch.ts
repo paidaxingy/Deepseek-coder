@@ -217,22 +217,37 @@ function isDeleteBlock(text: string) {
   return /(^|\n)\+\+\+\s+\/dev\/null\s*($|\n)/.test(text);
 }
 
+/** 补丁应用失败的详细信息 */
+export interface PatchFailureDetail {
+  file: string;
+  reason: string;
+  hunkInfo?: string;
+  patchContextLines?: string[];
+  actualFileLines?: string[];
+}
+
 /**
  * 直接应用补丁（不需要确认，完全自动化）
- * @returns 应用结果 { success: boolean, applied: string[], failed: string[] }
+ * @returns 应用结果 { success: boolean, applied: string[], failed: string[], failureDetails: PatchFailureDetail[] }
  */
-export async function applyPatchTextDirectly(patchText: string): Promise<{ success: boolean; applied: string[]; failed: string[] }> {
+export async function applyPatchTextDirectly(patchText: string): Promise<{
+  success: boolean;
+  applied: string[];
+  failed: string[];
+  failureDetails: PatchFailureDetail[];
+}> {
   const applied: string[] = [];
   const failed: string[] = [];
+  const failureDetails: PatchFailureDetail[] = [];
 
   patchText = stripMarkdownFences(patchText);
   if (!isProbablyUnifiedDiff(patchText)) {
-    return { success: false, applied, failed: ["不是有效的 unified diff"] };
+    return { success: false, applied, failed: ["不是有效的 unified diff"], failureDetails: [] };
   }
 
   const blocks = splitDiffIntoFileBlocks(patchText);
   if (!blocks.length) {
-    return { success: false, applied, failed: ["未解析到任何补丁内容"] };
+    return { success: false, applied, failed: ["未解析到任何补丁内容"], failureDetails: [] };
   }
 
   const rb = beginRollbackCapture("自动应用补丁（diff）");
@@ -302,11 +317,49 @@ export async function applyPatchTextDirectly(patchText: string): Promise<{ succe
       newText = applyPatch(oldTextForPatch, normalized);
     } catch (e) {
       // 多数是 hunk header 行数不匹配或 hunk 内缺少前缀导致的 Unknown line
+      console.error(`[applyPatch] 补丁应用异常: ${targetPath}`, {
+        error: e instanceof Error ? e.message : String(e),
+        patchPreview: normalized.slice(0, 500),
+        oldTextPreview: oldTextForPatch.slice(0, 500),
+      });
       failed.push(`${targetPath}: ${e instanceof Error ? e.message : String(e)}`);
       continue;
     }
     if (newText === false) {
+      // 详细日志：帮助定位上下文不匹配的原因
+      const hunkMatch = normalized.match(/@@ -(\d+),?(\d*) \+(\d+),?(\d*) @@/);
+      const hunkInfo = hunkMatch
+        ? `hunk @@ -${hunkMatch[1]},${hunkMatch[2] || "1"} +${hunkMatch[3]},${hunkMatch[4] || "1"} @@`
+        : "no hunk found";
+
+      // 提取 diff 中的上下文行（不以 +/- 开头的行）
+      const patchLines = normalized.split("\n");
+      const contextLines = patchLines
+        .filter(l => l.startsWith(" ") || (l.length > 0 && !l.startsWith("+") && !l.startsWith("-") && !l.startsWith("@") && !l.startsWith("diff") && !l.startsWith("---") && !l.startsWith("+++")))
+        .slice(0, 5);
+
+      // 获取文件对应位置的实际内容
+      const startLine = hunkMatch ? parseInt(hunkMatch[1], 10) - 1 : 0;
+      const oldLines = oldTextForPatch.split("\n");
+      const actualLines = oldLines.slice(startLine, startLine + 5);
+
+      console.error(`[applyPatch] 补丁上下文不匹配: ${targetPath}`, {
+        hunkInfo,
+        patchContextLines: contextLines,
+        actualFileLines: actualLines,
+        oldTextLength: oldTextForPatch.length,
+        patchLength: normalized.length,
+        patchPreview: normalized.slice(0, 800),
+      });
+
       failed.push(`${targetPath}: 补丁上下文不匹配`);
+      failureDetails.push({
+        file: targetPath,
+        reason: "补丁上下文不匹配",
+        hunkInfo,
+        patchContextLines: contextLines,
+        actualFileLines: actualLines,
+      });
       continue;
     }
 
@@ -326,7 +379,8 @@ export async function applyPatchTextDirectly(patchText: string): Promise<{ succe
   return {
     success: failed.length === 0 && applied.length > 0,
     applied,
-    failed
+    failed,
+    failureDetails,
   };
 }
 

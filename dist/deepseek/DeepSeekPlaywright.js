@@ -1009,12 +1009,12 @@ class DeepSeekPlaywright {
                 stableCount++;
             }
             // 连续多次相同且非空就认为稳定；
-            // 如果已经看到过“可执行内容”，也至少稳定 2 次再判断（避免网页还在 Reading/生成但 stop 图标检测偶发失灵）。
-            const stableNeed = actionableSeen ? 2 : 3;
+            // 提高稳定次数要求，避免长内容生成时误判为完成
+            const stableNeed = actionableSeen ? 4 : 5;
             if (lastText && stableCount >= stableNeed) {
                 const gen = await page
                     .evaluate(() => {
-                    // 输入区附近出现“正方形 rect”通常代表 stop/pause（生成中）
+                    // 方法1：输入区附近出现"正方形 rect"通常代表 stop/pause（生成中）
                     const svgs = document.querySelectorAll("div[class*='ds-icon-button'] svg");
                     for (let i = 0; i < svgs.length; i++) {
                         const svg = svgs[i];
@@ -1026,16 +1026,38 @@ class DeepSeekPlaywright {
                             continue;
                         const r = parent.getBoundingClientRect();
                         if (r.width > 20 && r.top > window.innerHeight * 0.5)
-                            return { hasStop: true };
+                            return { hasStop: true, method: "rect" };
+                    }
+                    // 方法2：检查是否有 "停止生成" / "Stop" 按钮文本
+                    const buttons = document.querySelectorAll("button, div[role='button'], [class*='button']");
+                    for (let i = 0; i < buttons.length; i++) {
+                        const btn = buttons[i];
+                        const text = (btn.textContent || "").trim().toLowerCase();
+                        if (text.includes("stop") || text.includes("停止") || text.includes("暂停")) {
+                            const r = btn.getBoundingClientRect();
+                            if (r.width > 20 && r.height > 20 && r.top > window.innerHeight * 0.4) {
+                                return { hasStop: true, method: "text" };
+                            }
+                        }
+                    }
+                    // 方法3：检查是否有加载动画/spinner
+                    const spinners = document.querySelectorAll("[class*='loading'], [class*='spinner'], [class*='typing']");
+                    for (let i = 0; i < spinners.length; i++) {
+                        const el = spinners[i];
+                        const r = el.getBoundingClientRect();
+                        if (r.width > 0 && r.height > 0)
+                            return { hasStop: true, method: "spinner" };
                     }
                     return { hasStop: false };
                 })
                     .catch(() => ({ hasStop: false }));
                 const stillGenerating = Boolean(gen?.hasStop);
                 if (stillGenerating) {
-                    debug?.({ level: "info", msg: "message stabilized but still generating; keep waiting" });
+                    debug?.({ level: "info", msg: "message stabilized but still generating; keep waiting", data: { method: gen?.method } });
                 }
                 else {
+                    // 在提取最终内容前，先滚动所有代码块到底部，强制渲染虚拟滚动的完整内容
+                    await this.scrollCodeBlocksToLoadAll(lastMessage, debug);
                     const finalKey = await this.extractStructuredAssistantTextFromMessage(lastMessage, lastText, debug);
                     // 如果最终提取出来是空（通常意味着拿到的只是 UI 噪音/占位），继续等待，不要提前 done
                     if (!finalKey.trim()) {
@@ -1044,9 +1066,26 @@ class DeepSeekPlaywright {
                         await this.safeWait(page, 600, signal);
                         continue;
                     }
+                    // 检测未闭合的代码块（任何语言）
+                    if (this.hasUnclosedCodeBlock(finalKey)) {
+                        debug?.({ level: "warn", msg: "stabilized but has unclosed code block; keep waiting", data: { chars: lastText.length } });
+                        stableCount = 0;
+                        await this.safeWait(page, 600, signal);
+                        continue;
+                    }
                     // 兜底：即使 stop 图标没检测到，如果 diff 结构还不完整，也不要提前结束
                     if (actionableSeen && /diff --git /.test(finalKey) && !this.isLikelyCompleteUnifiedDiff(finalKey)) {
                         debug?.({ level: "warn", msg: "stabilized but diff looks incomplete; keep waiting", data: { chars: lastText.length } });
+                        stableCount = 0;
+                        await this.safeWait(page, 600, signal);
+                        continue;
+                    }
+                    else if (this.looksLikeIncompleteDiff(finalKey)) {
+                        // 检测到看起来像 diff 片段但还不完整的内容，继续等待
+                        debug?.({ level: "warn", msg: "stabilized but looks like incomplete diff fragment; keep waiting", data: { chars: lastText.length, preview: finalKey.slice(0, 200) } });
+                        stableCount = 0;
+                        await this.safeWait(page, 600, signal);
+                        continue;
                     }
                     else {
                         debug?.({ level: "info", msg: "message content finalized", data: { chars: lastText.length, actionableSeen } });
@@ -1089,7 +1128,51 @@ class DeepSeekPlaywright {
                     const s = window.getComputedStyle(h);
                     return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden";
                 };
-                const txt = (x) => (x.innerText || x.textContent || "").trim();
+                // 改进的文本提取函数：特殊处理代码块
+                const txt = (x) => {
+                    const el = x;
+                    // 检查是否是代码块容器（DeepSeek 的代码块通常有 pre 或特定 class）
+                    const codeBlocks = el.querySelectorAll("pre, code, [class*='code'], [class*='highlight']");
+                    if (codeBlocks.length > 0) {
+                        // 对于代码块，尝试多种方式获取完整内容
+                        // 遍历所有子节点，分别处理代码块和普通文本
+                        const processNode = (node) => {
+                            if (node.nodeType === Node.TEXT_NODE) {
+                                return node.textContent || "";
+                            }
+                            const htmlEl = node;
+                            if (!htmlEl.tagName)
+                                return "";
+                            const tagName = htmlEl.tagName.toLowerCase();
+                            // 代码块：优先从 data 属性或特殊属性获取完整内容
+                            if (tagName === "pre" || tagName === "code" || htmlEl.className?.includes("code")) {
+                                // 方法1：检查 data-* 属性（某些网站会把完整代码存在这里）
+                                const dataCode = htmlEl.getAttribute("data-code") ||
+                                    htmlEl.getAttribute("data-content") ||
+                                    htmlEl.getAttribute("data-raw");
+                                if (dataCode)
+                                    return dataCode;
+                                // 方法2：检查是否有隐藏的完整内容元素
+                                const hiddenContent = htmlEl.querySelector("[style*='display: none'], [hidden], .hidden");
+                                if (hiddenContent && hiddenContent.textContent) {
+                                    return hiddenContent.textContent;
+                                }
+                                // 方法3：尝试获取所有行元素的内容（虚拟滚动场景）
+                                const lines = htmlEl.querySelectorAll("[class*='line'], [class*='row'], tr, .token-line");
+                                if (lines.length > 0) {
+                                    return Array.from(lines).map(l => l.innerText || l.textContent || "").join("\n");
+                                }
+                                // 方法4：直接获取 textContent（比 innerText 更完整，不受 CSS 影响）
+                                return htmlEl.textContent || htmlEl.innerText || "";
+                            }
+                            // 普通元素：递归处理子节点
+                            return Array.from(htmlEl.childNodes).map(processNode).join("");
+                        };
+                        return processNode(el).trim();
+                    }
+                    // 非代码块：使用 innerText
+                    return (el.innerText || el.textContent || "").trim();
+                };
                 const children = Array.from(root.children).filter((c) => isVisible(c));
                 const thinkingLike = (s) => /(^|\n)\s*(Thinking|Thought for|思考|推理)\b/i.test(s);
                 const idx = children.findIndex((c) => thinkingLike(txt(c)));
@@ -1098,7 +1181,7 @@ class DeepSeekPlaywright {
                 }
                 const thinkEl = children[idx];
                 const thinkText = txt(thinkEl);
-                // header：取第一行中最像 “Thought for ...” 或 “Thinking”
+                // header：取第一行中最像 "Thought for ..." 或 "Thinking"
                 const lines = thinkText
                     .split(/\r?\n/)
                     .map((x) => x.trim())
@@ -1107,6 +1190,7 @@ class DeepSeekPlaywright {
                 // body：去掉重复的 Thinking 标记行
                 const bodyLines = lines.filter((l) => !/^Thinking\b/i.test(l) && !/^Thought for\b/i.test(l) && !/^思考\b/.test(l) && !/^推理\b/.test(l));
                 const thinkingBody = bodyLines.join("\n").trim();
+                // 改进：对 answer 部分的每个子元素单独提取，确保代码块内容完整
                 const answerParts = children
                     .slice(idx + 1)
                     .map((c) => txt(c))
@@ -1120,9 +1204,9 @@ class DeepSeekPlaywright {
                 const thinkingBody = String(raw.thinkingBody || "");
                 const answerRaw = String(raw.answer || "");
                 // 关键：把 answer 部分归一化成我们可识别的 toolplan/toolcall/diff/bash（必要时包裹 fenced）
-                // 这样 toolplan 才能被继续流程识别并执行，而不是停在“摘要”状态。
+                // 这样 toolplan 才能被继续流程识别并执行，而不是停在"摘要"状态。
                 const answer = this.extractKeyContentFromRawReply(answerRaw);
-                // 若只有 thinking 没有 answer，也照样输出结构化文本（前端会按“思考中”渲染）
+                // 若只有 thinking 没有 answer，也照样输出结构化文本（前端会按"思考中"渲染）
                 return this.buildStructuredParts(thinkingHeader, thinkingBody, answer);
             }
         }
@@ -1130,7 +1214,14 @@ class DeepSeekPlaywright {
             debug?.({ level: "warn", msg: "structured extract failed; fallback to text", data: { error: e instanceof Error ? e.message : String(e) } });
         }
         // fallback：旧逻辑
-        return this.extractKeyContentFromRawReply(fallbackInnerText);
+        // 重要：如果文本中包含 <<<DS_ANSWER>>> 标记，只从 answer 部分提取内容
+        // 避免 thinking 部分的 diff 示例被误识别为正式输出
+        let textForExtract = fallbackInnerText;
+        const answerIdx = fallbackInnerText.indexOf("<<<DS_ANSWER>>>");
+        if (answerIdx !== -1) {
+            textForExtract = fallbackInnerText.slice(answerIdx + "<<<DS_ANSWER>>>".length).trim();
+        }
+        return this.extractKeyContentFromRawReply(textForExtract);
     }
     /**
      * 从原始回复中提取有效内容（toolplan/toolcall/diff）
@@ -1211,9 +1302,12 @@ class DeepSeekPlaywright {
         return text;
     }
     isActionableKeyContentComplete(key) {
-        const s = (key || "").trim();
-        if (!s)
+        const raw = (key || "").trim();
+        if (!raw)
             return false;
+        // 重要：只检查 answer 部分，避免 thinking 中的 diff 示例被误识别
+        const answerIdx = raw.indexOf("<<<DS_ANSWER>>>");
+        const s = answerIdx === -1 ? raw : raw.slice(answerIdx + "<<<DS_ANSWER>>>".length).trim();
         // fenced tool blocks
         if (/^```toolplan\b[\s\S]*?```$/m.test(s))
             return true;
@@ -1251,6 +1345,139 @@ class DeepSeekPlaywright {
         if (!hasHunk && !hasNewFile)
             return false;
         return true;
+    }
+    /**
+     * 检测内容是否"看起来像 diff 但还不完整"
+     * 用于防止在 diff 生成到一半时提前结束
+     */
+    looksLikeIncompleteDiff(key) {
+        const raw = String(key || "").trim();
+        if (!raw)
+            return false;
+        // 只看 answer 区（如果存在结构化标记）
+        const idx = raw.indexOf("<<<DS_ANSWER>>>");
+        const s = idx === -1 ? raw : raw.slice(idx + "<<<DS_ANSWER>>>".length).trim();
+        // 如果已经是完整 diff，返回 false
+        if (this.isLikelyCompleteUnifiedDiff(key))
+            return false;
+        // 检测 1：有 ```diff 开头但没有闭合的 ```
+        if (/```diff\b/i.test(s) && !/```diff\b[\s\S]*?```/m.test(s)) {
+            return true;
+        }
+        // 检测 2：有 diff --git 但结构不完整（缺少 ---/+++/@@ 等）
+        if (/diff --git /.test(s)) {
+            const hasMinus = /\n--- /.test(s);
+            const hasPlus = /\n\+\+\+ /.test(s);
+            const hasHunk = /\n@@ /.test(s);
+            // 有 diff --git 但缺少必要结构
+            if (!hasMinus || !hasPlus || !hasHunk)
+                return true;
+        }
+        // 检测 3：有典型的 diff 内容行（+/- 开头）但没有 diff --git 头
+        // 这种情况说明 diff 正在生成中，头部还没出来或被截断
+        const lines = s.split("\n");
+        let diffContentLines = 0;
+        let contextLines = 0;
+        for (const line of lines) {
+            // diff 内容行：以 + 或 - 开头（但不是 +++ 或 ---）
+            if (/^[+-][^+-]/.test(line) || /^[+-]$/.test(line)) {
+                diffContentLines++;
+            }
+            // 上下文行：以空格开头
+            if (/^ /.test(line)) {
+                contextLines++;
+            }
+        }
+        // 如果有多行 diff 内容但没有 diff --git，说明是不完整的 diff
+        if (diffContentLines >= 2 && !/diff --git /.test(s)) {
+            return true;
+        }
+        // 如果有 diff 内容行和上下文行的组合，很可能是 diff 片段
+        if (diffContentLines >= 1 && contextLines >= 2 && !/diff --git /.test(s)) {
+            return true;
+        }
+        // 检测 4：有 @@ -n,m +n,m @@ 格式的 hunk 头但没有 diff --git
+        if (/@@\s*-\d+,?\d*\s+\+\d+,?\d*\s*@@/.test(s) && !/diff --git /.test(s)) {
+            return true;
+        }
+        // 检测 5：有 --- a/ 或 +++ b/ 但没有 diff --git
+        if ((/\n--- a\//.test(s) || /\n\+\+\+ b\//.test(s)) && !/diff --git /.test(s)) {
+            return true;
+        }
+        return false;
+    }
+    /**
+     * 检测内容是否有未闭合的代码块
+     * 用于防止在代码块生成到一半时提前结束
+     */
+    hasUnclosedCodeBlock(key) {
+        const raw = String(key || "").trim();
+        if (!raw)
+            return false;
+        // 只看 answer 区（如果存在结构化标记）
+        const idx = raw.indexOf("<<<DS_ANSWER>>>");
+        const s = idx === -1 ? raw : raw.slice(idx + "<<<DS_ANSWER>>>".length).trim();
+        // 统计 ``` 的数量，奇数说明有未闭合的代码块
+        const fenceMatches = s.match(/```/g);
+        const fenceCount = fenceMatches ? fenceMatches.length : 0;
+        if (fenceCount % 2 !== 0) {
+            return true;
+        }
+        // 检测常见的代码块开始标记但没有对应的闭合
+        const codeBlockStarts = [
+            /```(?:diff|bash|sh|shell|javascript|typescript|python|json|html|css|xml|yaml|toml|sql|go|rust|java|c|cpp|csharp|php|ruby|swift|kotlin)\s*\n/gi
+        ];
+        for (const pattern of codeBlockStarts) {
+            const matches = s.match(pattern);
+            if (matches) {
+                // 对于每个开始标记，检查后面是否有闭合的 ```
+                for (const match of matches) {
+                    const startIdx = s.indexOf(match);
+                    const afterStart = s.slice(startIdx + match.length);
+                    // 如果开始标记后面没有 ```，说明未闭合
+                    if (!afterStart.includes("```")) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+    /**
+     * 滚动代码块以加载虚拟滚动的完整内容
+     * DeepSeek 网页的代码块可能使用虚拟滚动，只渲染可见部分
+     */
+    async scrollCodeBlocksToLoadAll(lastMessage, debug) {
+        try {
+            await lastMessage.evaluate((el) => {
+                const root = el;
+                // 找到所有可能使用虚拟滚动的代码块容器
+                const codeContainers = root.querySelectorAll("pre, [class*='code'], [class*='highlight'], [class*='editor']");
+                for (const container of Array.from(codeContainers)) {
+                    const htmlEl = container;
+                    // 检查是否有滚动条（说明内容超出可见区域）
+                    if (htmlEl.scrollHeight > htmlEl.clientHeight) {
+                        // 先滚动到底部
+                        htmlEl.scrollTop = htmlEl.scrollHeight;
+                        // 再滚动回顶部（触发完整渲染）
+                        htmlEl.scrollTop = 0;
+                        // 最后滚动到底部确保所有内容都被渲染
+                        htmlEl.scrollTop = htmlEl.scrollHeight;
+                    }
+                }
+                // 也处理消息容器本身的滚动
+                if (root.scrollHeight > root.clientHeight) {
+                    const originalScroll = root.scrollTop;
+                    root.scrollTop = root.scrollHeight;
+                    root.scrollTop = 0;
+                    root.scrollTop = originalScroll; // 恢复原位置
+                }
+            });
+            debug?.({ level: "info", msg: "scrolled code blocks to load virtual content" });
+        }
+        catch (e) {
+            debug?.({ level: "warn", msg: "failed to scroll code blocks", data: { error: e instanceof Error ? e.message : String(e) } });
+        }
     }
     /**
      * 清理 DeepSeek 网页 UI 文本（Copy/Download 按钮、代码块标签等）

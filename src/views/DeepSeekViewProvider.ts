@@ -2229,8 +2229,12 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
       await this.notifyInChat(threadId, "🔒 只读模式：已拦截自动应用 diff。你可以点击消息里的「预览并应用补丁」手动确认。");
       return;
     }
-    this.debug("info", "autoApplyDiff: starting", { diffChars: diffText.length });
-    
+    this.debug("info", "autoApplyDiff: starting", {
+      diffChars: diffText.length,
+      diffPreview: diffText.slice(0, 500),
+      diffTail: diffText.slice(-200),
+    });
+
     // 直接应用补丁，不需要确认
     const result = await applyPatchTextDirectly(diffText);
 
@@ -2239,20 +2243,40 @@ export class DeepSeekViewProvider implements vscode.WebviewViewProvider {
       `applied(${result.applied.length}): ${result.applied.join(", ") || "-"}`,
       `failed(${result.failed.length}): ${result.failed.join("; ") || "-"}`,
     ].join("\n");
-    
+
     if (result.applied.length > 0) {
       this.debug("info", "autoApplyDiff: applied", { files: result.applied });
       await this.notifyInChat(threadId, `✅ 已自动应用补丁：${result.applied.join(", ")}`);
     }
-    
+
     if (result.failed.length > 0) {
-      this.debug("warn", "autoApplyDiff: some failed", { errors: result.failed });
+      this.debug("warn", "autoApplyDiff: some failed", { errors: result.failed, failureDetails: result.failureDetails });
       await this.notifyInChat(threadId, `⚠️ 部分补丁失败：${result.failed.join("; ")}`);
     }
-    
+
     if (!result.success && result.applied.length === 0) {
-      this.debug("error", "autoApplyDiff: all failed", { errors: result.failed });
-      throw new Error(`补丁应用失败：${result.failed.join("; ")}`);
+      this.debug("error", "autoApplyDiff: all failed", { errors: result.failed, failureDetails: result.failureDetails });
+
+      // 构建详细错误信息，用于发送给 DeepSeek 重试
+      let detailedError = `补丁应用失败：${result.failed.join("; ")}`;
+      if (result.failureDetails.length > 0) {
+        const details = result.failureDetails.map(d => {
+          const lines = [`文件: ${d.file}`, `原因: ${d.reason}`];
+          if (d.hunkInfo) lines.push(`位置: ${d.hunkInfo}`);
+          if (d.patchContextLines?.length) {
+            lines.push(`diff 中的上下文行:`);
+            d.patchContextLines.forEach(l => lines.push(`  "${l}"`));
+          }
+          if (d.actualFileLines?.length) {
+            lines.push(`文件实际内容:`);
+            d.actualFileLines.forEach(l => lines.push(`  "${l}"`));
+          }
+          return lines.join("\n");
+        }).join("\n---\n");
+        detailedError += `\n\n详细信息:\n${details}`;
+      }
+
+      throw new Error(detailedError);
     }
 
     // 让结果可见 + 可用于后续继续（像 Claude Code）
